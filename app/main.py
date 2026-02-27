@@ -23,8 +23,8 @@ from sqlalchemy import (
     create_engine,
     delete,
     func,
+    inspect,
     select,
-    text,
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
@@ -57,6 +57,9 @@ MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
 LOCKOUT_MINUTES = int(os.getenv("LOCKOUT_MINUTES", "15"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
 RATE_LIMIT_MAX_ATTEMPTS = int(os.getenv("RATE_LIMIT_MAX_ATTEMPTS", "10"))
+AUTH_FAILURE_LOG_RETENTION_DAYS = int(os.getenv("AUTH_FAILURE_LOG_RETENTION_DAYS", "30"))
+LOGIN_ATTEMPT_RETENTION_DAYS = int(os.getenv("LOGIN_ATTEMPT_RETENTION_DAYS", "7"))
+CLEANUP_INTERVAL_MINUTES = int(os.getenv("CLEANUP_INTERVAL_MINUTES", "60"))
 
 # -------------------------
 # Database setup
@@ -116,48 +119,7 @@ class RevokedToken(Base):
     expires_at = Column(DateTime, nullable=False)
 
 
-Base.metadata.create_all(bind=engine)
-
-
-def _ensure_users_schema() -> None:
-    with engine.begin() as conn:
-        tables = conn.execute(
-            text("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
-        ).fetchall()
-        if not tables:
-            return
-
-        existing_cols = {
-            row[1] for row in conn.execute(text("PRAGMA table_info(users)")).fetchall()
-        }
-        if "role" not in existing_cols:
-            conn.execute(text("ALTER TABLE users ADD COLUMN role VARCHAR DEFAULT 'user'"))
-            conn.execute(text("UPDATE users SET role='user' WHERE role IS NULL"))
-        if "failed_login_attempts" not in existing_cols:
-            conn.execute(
-                text("ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0")
-            )
-            conn.execute(
-                text(
-                    "UPDATE users SET failed_login_attempts=0 "
-                    "WHERE failed_login_attempts IS NULL"
-                )
-            )
-        if "locked_until" not in existing_cols:
-            conn.execute(text("ALTER TABLE users ADD COLUMN locked_until DATETIME"))
-        if "refresh_token_version" not in existing_cols:
-            conn.execute(
-                text("ALTER TABLE users ADD COLUMN refresh_token_version INTEGER DEFAULT 0")
-            )
-            conn.execute(
-                text(
-                    "UPDATE users SET refresh_token_version=0 "
-                    "WHERE refresh_token_version IS NULL"
-                )
-            )
-
-
-_ensure_users_schema()
+last_cleanup_run: Optional[datetime] = None
 
 
 # -------------------------
@@ -291,6 +253,50 @@ def _check_login_rate_limit(request: Request, db: Session) -> str:
         )
 
     return client_ip
+
+
+def _normalize_rowcount(rowcount: Optional[int]) -> int:
+    return rowcount if rowcount and rowcount > 0 else 0
+
+
+def run_cleanup_jobs(db: Session, force: bool = False) -> dict:
+    global last_cleanup_run
+
+    now = utcnow_naive()
+    if (
+        not force
+        and last_cleanup_run is not None
+        and now - last_cleanup_run < timedelta(minutes=CLEANUP_INTERVAL_MINUTES)
+    ):
+        return {
+            "status": "skipped",
+            "ran_at": now,
+            "revoked_tokens_deleted": 0,
+            "auth_failure_logs_deleted": 0,
+            "login_attempts_deleted": 0,
+        }
+
+    revoked_deleted = _normalize_rowcount(
+        db.execute(delete(RevokedToken).where(RevokedToken.expires_at < now)).rowcount
+    )
+    auth_cutoff = now - timedelta(days=AUTH_FAILURE_LOG_RETENTION_DAYS)
+    auth_logs_deleted = _normalize_rowcount(
+        db.execute(delete(AuthFailureLog).where(AuthFailureLog.created_at < auth_cutoff)).rowcount
+    )
+    login_cutoff = now - timedelta(days=LOGIN_ATTEMPT_RETENTION_DAYS)
+    login_attempts_deleted = _normalize_rowcount(
+        db.execute(delete(LoginAttempt).where(LoginAttempt.created_at < login_cutoff)).rowcount
+    )
+
+    db.commit()
+    last_cleanup_run = now
+    return {
+        "status": "ok",
+        "ran_at": now,
+        "revoked_tokens_deleted": revoked_deleted,
+        "auth_failure_logs_deleted": auth_logs_deleted,
+        "login_attempts_deleted": login_attempts_deleted,
+    }
 
 
 def _is_user_locked(user: User) -> bool:
@@ -467,10 +473,25 @@ class AuthFailureLogOut(BaseModel):
     created_at: datetime
 
 
+class AuthFailureLogPageOut(BaseModel):
+    items: list[AuthFailureLogOut]
+    page: int
+    page_size: int
+    total: int
+
+
 class AdminActionOut(BaseModel):
     status: str
     username: str
     refresh_token_version: int
+
+
+class CleanupOut(BaseModel):
+    status: str
+    ran_at: datetime
+    revoked_tokens_deleted: int
+    auth_failure_logs_deleted: int
+    login_attempts_deleted: int
 
 
 # -------------------------
@@ -482,6 +503,23 @@ app = FastAPI(title="Secure API Capstone Starter")
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(_request: Request, exc: RequestValidationError):
     return JSONResponse(status_code=400, content={"detail": exc.errors()})
+
+
+def _validate_required_schema() -> None:
+    with engine.connect() as conn:
+        table_names = set(inspect(conn).get_table_names())
+    required = {"users", "login_attempts", "auth_failure_logs", "revoked_tokens"}
+    missing = sorted(required - table_names)
+    if missing:
+        raise RuntimeError(
+            "Database schema is missing required tables: "
+            f"{', '.join(missing)}. Run `alembic upgrade head`."
+        )
+
+
+@app.on_event("startup")
+def startup_checks() -> None:
+    _validate_required_schema()
 
 
 @app.get("/health")
@@ -516,6 +554,7 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
 
 @app.post("/login", response_model=TokenOut)
 def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
+    run_cleanup_jobs(db=db, force=False)
     client_ip = _check_login_rate_limit(request=request, db=db)
 
     user = get_user_by_username(db, data.username)
@@ -616,23 +655,46 @@ def admin_unlock_user(
     return {"status": "ok", "message": f"User '{username}' unlocked"}
 
 
-@app.get("/admin/auth-failures", response_model=list[AuthFailureLogOut])
+@app.get("/admin/auth-failures", response_model=AuthFailureLogPageOut)
 def admin_auth_failures(
-    limit: int = 50,
+    page: int = 1,
+    page_size: int = 50,
+    username: Optional[str] = None,
+    ip_address: Optional[str] = None,
+    reason: Optional[str] = None,
     _admin: User = Depends(require_admin),
     db: Session = Depends(get_db),
 ):
-    safe_limit = max(1, min(limit, 200))
-    logs = (
-        db.execute(
-            select(AuthFailureLog)
-            .order_by(AuthFailureLog.created_at.desc(), AuthFailureLog.id.desc())
-            .limit(safe_limit)
-        )
-        .scalars()
-        .all()
+    safe_page = max(1, page)
+    safe_page_size = max(1, min(page_size, 200))
+    conditions = []
+    if username:
+        conditions.append(AuthFailureLog.username == username)
+    if ip_address:
+        conditions.append(AuthFailureLog.ip_address == ip_address)
+    if reason:
+        conditions.append(AuthFailureLog.reason == reason)
+
+    item_query = select(AuthFailureLog)
+    count_query = select(func.count()).select_from(AuthFailureLog)
+    if conditions:
+        item_query = item_query.where(*conditions)
+        count_query = count_query.where(*conditions)
+
+    total = db.scalar(count_query) or 0
+    offset = (safe_page - 1) * safe_page_size
+    logs = db.execute(
+        item_query
+        .order_by(AuthFailureLog.created_at.desc(), AuthFailureLog.id.desc())
+        .offset(offset)
+        .limit(safe_page_size)
     )
-    return logs
+    return AuthFailureLogPageOut(
+        items=logs.scalars().all(),
+        page=safe_page,
+        page_size=safe_page_size,
+        total=int(total),
+    )
 
 
 @app.post("/admin/users/{username}/revoke-refresh-tokens", response_model=AdminActionOut)
@@ -654,3 +716,12 @@ def admin_revoke_refresh_tokens(
         username=user.username,
         refresh_token_version=user.refresh_token_version,
     )
+
+
+@app.post("/admin/maintenance/cleanup", response_model=CleanupOut)
+def admin_cleanup_maintenance(
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    result = run_cleanup_jobs(db=db, force=True)
+    return CleanupOut(**result)
