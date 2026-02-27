@@ -3,7 +3,7 @@ import logging
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Optional
 from uuid import uuid4
 
 import bcrypt as bcrypt_lib
@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, ConfigDict, constr
+from pydantic import BaseModel, ConfigDict, StringConstraints
 from sqlalchemy import (
     Column,
     DateTime,
@@ -421,14 +421,14 @@ def require_admin(current_user: User = Depends(get_current_user)) -> User:
 # API models
 # -------------------------
 class RegisterIn(BaseModel):
-    username: constr(min_length=3, max_length=64)
-    password: constr(min_length=6, max_length=256)
+    username: Annotated[str, StringConstraints(min_length=3, max_length=64)]
+    password: Annotated[str, StringConstraints(min_length=6, max_length=256)]
     role: Optional[str] = None
 
 
 class LoginIn(BaseModel):
-    username: constr(min_length=1, max_length=64)
-    password: constr(min_length=1, max_length=256)
+    username: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+    password: Annotated[str, StringConstraints(min_length=1, max_length=256)]
 
 
 class TokenOut(BaseModel):
