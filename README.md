@@ -16,7 +16,12 @@ FastAPI security capstone app with JWT auth, API key auth, RBAC, and basic login
    ```bash
    pip install -r requirements.txt
    ```
-4. Run the API:
+4. Set environment variables (minimum required):
+   ```bash
+   export JWT_SECRET="replace-with-a-long-random-secret"
+   ```
+   Or copy `.env.example` and export values from there.
+5. Run the API:
    ```bash
    uvicorn app.main:app --reload
    ```
@@ -107,3 +112,14 @@ python scripts/token_tampering.py
 python scripts/unauthorized_admin_access.py
 python scripts/performance_test.py
 ```
+
+## Tag + Release Flow
+
+Create a semantic version tag for each milestone submission:
+
+```bash
+git tag -a v0.1.0 -m "Milestone 1"
+git push origin v0.1.0
+```
+
+Pushing a `v*.*.*` tag triggers GitHub Actions to create a GitHub Release automatically.

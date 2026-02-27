@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Compile check
+        run: |
+          python -m compileall app scripts
+
+      - name: API smoke test
+        env:
+          JWT_SECRET: ci-secret-not-for-production
+        run: |
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+          APP_PID=$!
+          trap "kill $APP_PID" EXIT
+          sleep 3
+
+          curl -fsS http://127.0.0.1:8000/health
+
+          curl -fsS -X POST http://127.0.0.1:8000/register \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"ciuser","password":"secret123"}'
+
+          TOKEN=$(curl -fsS -X POST http://127.0.0.1:8000/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"ciuser","password":"secret123"}' \
+            | python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+
+          curl -fsS http://127.0.0.1:8000/profile -H "Authorization: Bearer $TOKEN"
+          curl -fsS http://127.0.0.1:8000/data -H "X-API-Key: capstone-demo-key"
