@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import json
 import time
-from urllib import request, error
+from urllib import error, request
 
 BASE_URL = "http://127.0.0.1:8000"
 USERNAME = f"bf_user_{int(time.time())}"

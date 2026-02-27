@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import json
-from urllib import request, error
+from urllib import error, request
 
 BASE_URL = "http://127.0.0.1:8000"
 
@@ -37,17 +37,13 @@ def main() -> None:
         print(f"[-] Unexpected register status={register_status}, body={register_body}")
         return
 
-    login_status, login_body = post_json(
-        "/login", {"username": "bob", "password": "bobsecret"}
-    )
+    login_status, login_body = post_json("/login", {"username": "bob", "password": "bobsecret"})
     if login_status != 200:
         print(f"[-] Unable to login as bob. status={login_status}, body={login_body}")
         return
 
     token = json.loads(login_body)["access_token"]
-    admin_status, admin_body = get(
-        "/admin/users", headers={"Authorization": f"Bearer {token}"}
-    )
+    admin_status, admin_body = get("/admin/users", headers={"Authorization": f"Bearer {token}"})
 
     if admin_status == 403:
         print("[+] PASS: Non-admin user denied admin endpoint")
