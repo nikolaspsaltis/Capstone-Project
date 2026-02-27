@@ -27,13 +27,35 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Ruff lint
+        run: |
+          ruff check .
+
+      - name: Black format check
+        run: |
+          black --check .
+
       - name: Compile check
         run: |
           python -m compileall app scripts
 
+      - name: Pytest with coverage
+        env:
+          JWT_SECRET: ci-secret-not-for-production
+          JWT_ISSUER: capstone-tests
+          JWT_AUDIENCE: capstone-tests-client
+          DATABASE_URL: sqlite:///./ci_test.db
+          API_KEYS: test-api-key
+        run: |
+          pytest
+
       - name: API smoke test
         env:
           JWT_SECRET: ci-secret-not-for-production
+          JWT_ISSUER: capstone-project
+          JWT_AUDIENCE: capstone-client
+          DATABASE_URL: sqlite:///./ci_smoke.db
+          API_KEYS: capstone-demo-key
         run: |
           uvicorn app.main:app --host 127.0.0.1 --port 8000 &
           APP_PID=$!
