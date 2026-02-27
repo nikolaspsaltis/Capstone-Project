@@ -1,6 +1,6 @@
 # CAPSTONE-PROJECT
 
-FastAPI security capstone app with JWT auth, API key auth, RBAC, and basic login defenses.
+FastAPI security capstone app with JWT auth, API key auth, RBAC, refresh token rotation, and basic security defenses.
 
 ## Setup
 
@@ -16,19 +16,19 @@ FastAPI security capstone app with JWT auth, API key auth, RBAC, and basic login
    ```bash
    pip install -r requirements.txt
    ```
-4. Set environment variables (minimum required):
+4. Configure environment variables:
    ```bash
-   export JWT_SECRET="replace-with-a-long-random-secret"
+   cp .env.example .env
+   export $(grep -v '^#' .env | xargs)
    ```
-   Or copy `.env.example` and export values from there.
 5. Run the API:
    ```bash
    uvicorn app.main:app --reload
    ```
 
-## Quick Test (curl)
+## Core Endpoints
 
-### 1) Health
+### Health
 ```bash
 curl -X GET http://127.0.0.1:8000/health
 ```
@@ -37,18 +37,18 @@ Expected:
 {"status":"ok"}
 ```
 
-### 2) Register
+### Register
 ```bash
 curl -X POST http://127.0.0.1:8000/register \
   -H "Content-Type: application/json" \
   -d '{"username":"alice","password":"secret123"}'
 ```
-Expected (first call):
+Expected:
 ```json
 {"id":1,"username":"alice","role":"user"}
 ```
 
-### 3) Login
+### Login (access + refresh)
 ```bash
 curl -X POST http://127.0.0.1:8000/login \
   -H "Content-Type: application/json" \
@@ -56,10 +56,32 @@ curl -X POST http://127.0.0.1:8000/login \
 ```
 Expected:
 ```json
-{"access_token":"<jwt>","token_type":"bearer"}
+{"access_token":"<jwt>","refresh_token":"<refresh>","token_type":"bearer"}
 ```
 
-### 4) Profile (Bearer token)
+### Refresh
+```bash
+curl -X POST http://127.0.0.1:8000/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token":"<refresh>"}'
+```
+Expected:
+```json
+{"access_token":"<new-jwt>","refresh_token":"<new-refresh>","token_type":"bearer"}
+```
+
+### Logout (revoke refresh token)
+```bash
+curl -X POST http://127.0.0.1:8000/logout \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token":"<refresh>"}'
+```
+Expected:
+```json
+{"status":"ok","message":"Refresh token revoked"}
+```
+
+### Profile (Bearer token)
 ```bash
 curl -X GET http://127.0.0.1:8000/profile \
   -H "Authorization: Bearer <jwt>"
@@ -69,7 +91,7 @@ Expected:
 {"id":1,"username":"alice","role":"user"}
 ```
 
-### 5) Data with API Key
+### Data with API Key
 ```bash
 curl -X GET http://127.0.0.1:8000/data \
   -H "X-API-Key: capstone-demo-key"
@@ -79,17 +101,7 @@ Expected:
 {"data":"Sensitive data payload"}
 ```
 
-### 6) Data with JWT
-```bash
-curl -X GET http://127.0.0.1:8000/data \
-  -H "Authorization: Bearer <jwt>"
-```
-Expected:
-```json
-{"data":"Sensitive data payload"}
-```
-
-### 7) Admin users (admin only)
+### Admin users (admin only)
 ```bash
 curl -X GET http://127.0.0.1:8000/admin/users \
   -H "Authorization: Bearer <admin-jwt>"
@@ -98,28 +110,42 @@ Expected:
 - admin token: list of users
 - non-admin token: `{"detail":"Forbidden"}` with HTTP 403
 
+## Security Notes
+
+- JWT includes `iss`, `aud`, and `jti` claims; tokens are validated against configured issuer/audience.
+- Refresh tokens are rotated and revoked on use/logout.
+- Login rate limits are persisted in DB (`login_attempts` table).
+- Auth failures are logged to DB (`auth_failure_logs` table).
+- API key rotation is supported via `API_KEYS` (comma-separated).
+
+## Testing and Quality
+
+Run checks locally:
+```bash
+ruff check .
+black --check .
+pytest
+```
+
+## Alembic Migrations
+
+Create/upgrade schema with Alembic:
+```bash
+alembic upgrade head
+```
+
 ## Scripts
 
 - `scripts/bruteforce_login.py` - brute-force simulation against `/login`
-- `scripts/token_tampering.py` - modifies JWT payload and checks token rejection
-- `scripts/unauthorized_admin_access.py` - verifies non-admin cannot access `/admin/users`
-- `scripts/performance_test.py` - measures latency + requests/sec and writes CSV to `results/`
+- `scripts/token_tampering.py` - JWT tampering check
+- `scripts/unauthorized_admin_access.py` - non-admin RBAC check
+- `scripts/performance_test.py` - latency + requests/sec CSV output
+- `scripts/create_release_tag.sh` - release tag helper
 
-Run examples:
-```bash
-python scripts/bruteforce_login.py
-python scripts/token_tampering.py
-python scripts/unauthorized_admin_access.py
-python scripts/performance_test.py
-```
-
-## Tag + Release Flow
-
-Create a semantic version tag for each milestone submission:
+## Release Flow
 
 ```bash
-git tag -a v0.1.0 -m "Milestone 1"
-git push origin v0.1.0
+./scripts/create_release_tag.sh v0.2.0
 ```
 
-Pushing a `v*.*.*` tag triggers GitHub Actions to create a GitHub Release automatically.
+Pushing a `v*.*.*` tag triggers GitHub Actions release workflow.

@@ -4,3 +4,7 @@ __pycache__/
 app.db
 .env
 results/*.csv
+.pytest_cache/
+.ruff_cache/
+.coverage
+test_app.db
