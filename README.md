@@ -1,179 +1,170 @@
 # CAPSTONE-PROJECT
 
-FastAPI security capstone app with JWT auth, API key auth, RBAC, refresh token rotation, and basic security defenses.
+FastAPI security capstone API with:
+- JWT access + refresh token flow
+- API key authentication
+- RBAC (admin vs user)
+- account lockout + DB-backed rate limiting
+- auth failure logging
+- refresh token revocation/rotation
 
-## Setup
+## Quick Start
 
-1. Create virtual environment (if needed):
-   ```bash
-   python3 -m venv .venv
-   ```
-2. Activate virtual environment:
-   ```bash
-   source .venv/bin/activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Configure environment variables:
-   ```bash
-   cp .env.example .env
-   export $(grep -v '^#' .env | xargs)
-   ```
-5. Run the API:
-   ```bash
-   uvicorn app.main:app --reload
-   ```
+From project root:
 
-## Core Endpoints
-
-### Health
 ```bash
-curl -X GET http://127.0.0.1:8000/health
-```
-Expected:
-```json
-{"status":"ok"}
+cd "/home/nicholas/Documents/UoE Documents/Captone-Project"
 ```
 
-### Register
+Use the project venv (recommended):
+
 ```bash
-curl -X POST http://127.0.0.1:8000/register \
+source secure-api-capstone/.venv/bin/activate
+```
+
+If that venv does not exist:
+
+```bash
+python3 -m venv secure-api-capstone/.venv
+source secure-api-capstone/.venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+Configure environment variables:
+
+```bash
+cp .env.example .env
+set -a
+. ./.env
+set +a
+```
+
+Run the API:
+
+```bash
+uvicorn app.main:app --reload
+```
+
+## Environment Variables
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `JWT_SECRET` | Yes | none | Signing secret for JWT tokens |
+| `JWT_ALGORITHM` | No | `HS256` | JWT algorithm |
+| `JWT_EXPIRE_MINUTES` | No | `30` | Access token expiry |
+| `JWT_REFRESH_EXPIRE_MINUTES` | No | `10080` | Refresh token expiry |
+| `JWT_ISSUER` | No | `capstone-project` | Expected `iss` claim |
+| `JWT_AUDIENCE` | No | `capstone-client` | Expected `aud` claim |
+| `DATABASE_URL` | No | `sqlite:///./app.db` | SQLAlchemy DB URL |
+| `API_KEYS` | No | `capstone-demo-key` | Comma-separated API keys |
+| `MAX_LOGIN_ATTEMPTS` | No | `5` | Failed attempts before lockout |
+| `LOCKOUT_MINUTES` | No | `15` | Lockout duration |
+| `RATE_LIMIT_WINDOW_SECONDS` | No | `60` | Login rate limit window |
+| `RATE_LIMIT_MAX_ATTEMPTS` | No | `10` | Max login attempts per IP per window |
+
+## API Smoke Test (Copy/Paste)
+
+```bash
+BASE_URL="http://127.0.0.1:8000"
+
+curl -s "$BASE_URL/health"
+
+curl -s -X POST "$BASE_URL/register" \
   -H "Content-Type: application/json" \
   -d '{"username":"alice","password":"secret123"}'
-```
-Expected:
-```json
-{"id":1,"username":"alice","role":"user"}
-```
 
-### Login (access + refresh)
-```bash
-curl -X POST http://127.0.0.1:8000/login \
+LOGIN_JSON=$(curl -s -X POST "$BASE_URL/login" \
   -H "Content-Type: application/json" \
-  -d '{"username":"alice","password":"secret123"}'
-```
-Expected:
-```json
-{"access_token":"<jwt>","refresh_token":"<refresh>","token_type":"bearer"}
-```
+  -d '{"username":"alice","password":"secret123"}')
 
-### Refresh
-```bash
-curl -X POST http://127.0.0.1:8000/refresh \
+ACCESS_TOKEN=$(printf '%s' "$LOGIN_JSON" | python -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+REFRESH_TOKEN=$(printf '%s' "$LOGIN_JSON" | python -c 'import sys,json; print(json.load(sys.stdin)["refresh_token"])')
+
+curl -s "$BASE_URL/profile" -H "Authorization: Bearer $ACCESS_TOKEN"
+curl -s "$BASE_URL/data" -H "X-API-Key: capstone-demo-key"
+
+curl -s -X POST "$BASE_URL/refresh" \
   -H "Content-Type: application/json" \
-  -d '{"refresh_token":"<refresh>"}'
-```
-Expected:
-```json
-{"access_token":"<new-jwt>","refresh_token":"<new-refresh>","token_type":"bearer"}
+  -d "{\"refresh_token\":\"$REFRESH_TOKEN\"}"
 ```
 
-### Logout (revoke refresh token)
+## Admin Security Operations
+
+Admin-only endpoints:
+
+- `GET /admin/users`
+- `POST /admin/users/{username}/unlock`
+- `GET /admin/auth-failures?limit=50`
+- `POST /admin/users/{username}/revoke-refresh-tokens`
+
+Example admin flow:
+
 ```bash
-curl -X POST http://127.0.0.1:8000/logout \
+BASE_URL="http://127.0.0.1:8000"
+
+curl -s -X POST "$BASE_URL/register" \
   -H "Content-Type: application/json" \
-  -d '{"refresh_token":"<refresh>"}'
-```
-Expected:
-```json
-{"status":"ok","message":"Refresh token revoked"}
+  -d '{"username":"admin1","password":"adminpass","role":"admin"}'
+
+ADMIN_ACCESS=$(curl -s -X POST "$BASE_URL/login" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin1","password":"adminpass"}' \
+  | python -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+
+curl -s "$BASE_URL/admin/users" \
+  -H "Authorization: Bearer $ADMIN_ACCESS"
+
+curl -s -X POST "$BASE_URL/admin/users/alice/unlock" \
+  -H "Authorization: Bearer $ADMIN_ACCESS"
+
+curl -s "$BASE_URL/admin/auth-failures?limit=20" \
+  -H "Authorization: Bearer $ADMIN_ACCESS"
+
+curl -s -X POST "$BASE_URL/admin/users/alice/revoke-refresh-tokens" \
+  -H "Authorization: Bearer $ADMIN_ACCESS"
 ```
 
-### Profile (Bearer token)
+## Development Commands
+
+Lint/format/test:
+
 ```bash
-curl -X GET http://127.0.0.1:8000/profile \
-  -H "Authorization: Bearer <jwt>"
-```
-Expected:
-```json
-{"id":1,"username":"alice","role":"user"}
+python -m ruff check .
+python -m black --check .
+python -m pytest
 ```
 
-### Data with API Key
-```bash
-curl -X GET http://127.0.0.1:8000/data \
-  -H "X-API-Key: capstone-demo-key"
-```
-Expected:
-```json
-{"data":"Sensitive data payload"}
-```
+Migrations:
 
-### Admin users (admin only)
-```bash
-curl -X GET http://127.0.0.1:8000/admin/users \
-  -H "Authorization: Bearer <admin-jwt>"
-```
-Expected:
-- admin token: list of users
-- non-admin token: `{"detail":"Forbidden"}` with HTTP 403
-
-### Admin unlock user
-```bash
-curl -X POST http://127.0.0.1:8000/admin/users/<username>/unlock \
-  -H "Authorization: Bearer <admin-jwt>"
-```
-Expected:
-```json
-{"status":"ok","message":"User '<username>' unlocked"}
-```
-
-### Admin auth failure logs
-```bash
-curl -X GET "http://127.0.0.1:8000/admin/auth-failures?limit=20" \
-  -H "Authorization: Bearer <admin-jwt>"
-```
-Expected:
-- list of recent authentication failure events
-
-### Admin revoke refresh tokens for user
-```bash
-curl -X POST http://127.0.0.1:8000/admin/users/<username>/revoke-refresh-tokens \
-  -H "Authorization: Bearer <admin-jwt>"
-```
-Expected:
-```json
-{"status":"ok","username":"<username>","refresh_token_version":1}
-```
-
-## Security Notes
-
-- JWT includes `iss`, `aud`, and `jti` claims; tokens are validated against configured issuer/audience.
-- Refresh tokens are rotated and revoked on use/logout.
-- Login rate limits are persisted in DB (`login_attempts` table).
-- Auth failures are logged to DB (`auth_failure_logs` table).
-- API key rotation is supported via `API_KEYS` (comma-separated).
-
-## Testing and Quality
-
-Run checks locally:
-```bash
-ruff check .
-black --check .
-pytest
-```
-
-## Alembic Migrations
-
-Create/upgrade schema with Alembic:
 ```bash
 alembic upgrade head
 ```
 
 ## Scripts
 
-- `scripts/bruteforce_login.py` - brute-force simulation against `/login`
-- `scripts/token_tampering.py` - JWT tampering check
-- `scripts/unauthorized_admin_access.py` - non-admin RBAC check
-- `scripts/performance_test.py` - latency + requests/sec CSV output
-- `scripts/create_release_tag.sh` - release tag helper
+- `scripts/bruteforce_login.py`
+- `scripts/token_tampering.py`
+- `scripts/unauthorized_admin_access.py`
+- `scripts/performance_test.py`
+- `scripts/create_release_tag.sh`
 
-## Release Flow
+## Release
+
+Create and push a release tag:
 
 ```bash
-./scripts/create_release_tag.sh v0.2.0
+./scripts/create_release_tag.sh v0.3.0
 ```
 
-Pushing a `v*.*.*` tag triggers GitHub Actions release workflow.
+Pushing a `v*.*.*` tag triggers the GitHub Release workflow.
+
+## Troubleshooting
+
+- If `ruff`, `black`, or `pytest` is "not found", activate `secure-api-capstone/.venv` first.
+- If app startup fails with `JWT_SECRET must be set`, load `.env` before running `uvicorn`.
+- If a refresh token stops working after admin revoke, that is expected behavior.
