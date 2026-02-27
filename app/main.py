@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import os
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -24,19 +25,24 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 # -------------------------
 # Config
 # -------------------------
-SECRET_KEY = "CHANGE_ME_TO_A_LONG_RANDOM_STRING"
-ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30
-DATABASE_URL = "sqlite:///./app.db"
+SECRET_KEY = os.getenv("JWT_SECRET", "")
+ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "30"))
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
+
+if not SECRET_KEY or SECRET_KEY == "change-this-secret-in-production":
+    raise RuntimeError(
+        "JWT_SECRET must be set to a strong value (and not the placeholder) before running the app."
+    )
 
 # API keys can be moved to env vars later; this is intentionally simple.
 VALID_API_KEYS = {"capstone-demo-key"}
 
 # Login defense settings.
-MAX_LOGIN_ATTEMPTS = 5
-LOCKOUT_MINUTES = 15
-RATE_LIMIT_WINDOW_SECONDS = 60
-RATE_LIMIT_MAX_ATTEMPTS = 10
+MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
+LOCKOUT_MINUTES = int(os.getenv("LOCKOUT_MINUTES", "15"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.getenv("RATE_LIMIT_WINDOW_SECONDS", "60"))
+RATE_LIMIT_MAX_ATTEMPTS = int(os.getenv("RATE_LIMIT_MAX_ATTEMPTS", "10"))
 
 # -------------------------
 # Database setup
