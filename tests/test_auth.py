@@ -127,9 +127,11 @@ def test_tampered_jwt_is_rejected(client):
     payload = json.loads(base64.urlsafe_b64decode(payload_b64 + "==").decode("utf-8"))
     payload["sub"] = "admin"
 
-    tampered_payload_b64 = base64.urlsafe_b64encode(
-        json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    ).decode("utf-8").rstrip("=")
+    tampered_payload_b64 = (
+        base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+        .decode("utf-8")
+        .rstrip("=")
+    )
 
     tampered = f"{header_b64}.{tampered_payload_b64}.{signature}"
     response = client.get("/profile", headers={"Authorization": f"Bearer {tampered}"})

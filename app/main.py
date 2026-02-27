@@ -1,8 +1,8 @@
-from datetime import datetime, timedelta, timezone
 import hashlib
 import logging
 import os
 import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import uuid4
 
@@ -48,7 +48,9 @@ if not SECRET_KEY or SECRET_KEY == "change-this-secret-in-production":
     )
 
 # API key rotation is supported by comma-separated keys in API_KEYS.
-API_KEYS = [key.strip() for key in os.getenv("API_KEYS", "capstone-demo-key").split(",") if key.strip()]
+API_KEYS = [
+    key.strip() for key in os.getenv("API_KEYS", "capstone-demo-key").split(",") if key.strip()
+]
 
 # Login defense settings.
 MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
@@ -132,9 +134,7 @@ def _ensure_users_schema() -> None:
             conn.execute(text("UPDATE users SET role='user' WHERE role IS NULL"))
         if "failed_login_attempts" not in existing_cols:
             conn.execute(
-                text(
-                    "ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0"
-                )
+                text("ALTER TABLE users ADD COLUMN failed_login_attempts INTEGER DEFAULT 0")
             )
             conn.execute(
                 text(
@@ -169,13 +169,11 @@ oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="login", auto_error=False
 PASSLIB_BCRYPT_USABLE = hasattr(bcrypt_lib, "__about__")
 
 
-
 def _hash_api_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
 VALID_API_KEY_HASHES = {_hash_api_key(key) for key in API_KEYS}
-
 
 
 def has_valid_api_key(api_key: Optional[str]) -> bool:
@@ -189,13 +187,11 @@ def has_valid_api_key(api_key: Optional[str]) -> bool:
     return False
 
 
-
 def hash_password(password: str) -> str:
     if PASSLIB_BCRYPT_USABLE:
         return pwd_context.hash(password)
     hashed = bcrypt_lib.hashpw(password.encode("utf-8"), bcrypt_lib.gensalt())
     return hashed.decode("utf-8")
-
 
 
 def verify_password(password: str, password_hash: str) -> bool:
@@ -205,7 +201,6 @@ def verify_password(password: str, password_hash: str) -> bool:
         return bcrypt_lib.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
     except ValueError:
         return False
-
 
 
 def _create_token(subject: str, token_type: str, expires_minutes: int) -> str:
@@ -223,15 +218,16 @@ def _create_token(subject: str, token_type: str, expires_minutes: int) -> str:
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
-
 def create_access_token(subject: str) -> str:
-    return _create_token(subject=subject, token_type="access", expires_minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-
+    return _create_token(
+        subject=subject, token_type="access", expires_minutes=ACCESS_TOKEN_EXPIRE_MINUTES
+    )
 
 
 def create_refresh_token(subject: str) -> str:
-    return _create_token(subject=subject, token_type="refresh", expires_minutes=REFRESH_TOKEN_EXPIRE_MINUTES)
-
+    return _create_token(
+        subject=subject, token_type="refresh", expires_minutes=REFRESH_TOKEN_EXPIRE_MINUTES
+    )
 
 
 def get_user_by_username(db: Session, username: str) -> Optional[User]:
@@ -239,8 +235,9 @@ def get_user_by_username(db: Session, username: str) -> Optional[User]:
     return db.execute(stmt).scalars().first()
 
 
-
-def _record_auth_failure(db: Session, username: Optional[str], ip_address: str, reason: str) -> None:
+def _record_auth_failure(
+    db: Session, username: Optional[str], ip_address: str, reason: str
+) -> None:
     auth_logger.warning(
         "AUTH_FAILURE username=%s ip=%s reason=%s ts=%s",
         username,
@@ -249,7 +246,6 @@ def _record_auth_failure(db: Session, username: Optional[str], ip_address: str, 
         utcnow().isoformat(),
     )
     db.add(AuthFailureLog(username=username, ip_address=ip_address, reason=reason))
-
 
 
 def _check_login_rate_limit(request: Request, db: Session) -> str:
@@ -276,10 +272,8 @@ def _check_login_rate_limit(request: Request, db: Session) -> str:
     return client_ip
 
 
-
 def _is_user_locked(user: User) -> bool:
     return user.locked_until is not None and utcnow_naive() < user.locked_until
-
 
 
 def _register_auth_failure(
@@ -300,18 +294,15 @@ def _register_auth_failure(
     db.commit()
 
 
-
 def _reset_lock_state(user: User, db: Session) -> None:
     user.failed_login_attempts = 0
     user.locked_until = None
     db.commit()
 
 
-
 def _is_token_revoked(db: Session, jti: str) -> bool:
     token = db.execute(select(RevokedToken).where(RevokedToken.jti == jti)).scalars().first()
     return token is not None
-
 
 
 def _revoke_token(db: Session, jti: str, token_type: str, exp_value: int) -> None:
@@ -322,7 +313,6 @@ def _revoke_token(db: Session, jti: str, token_type: str, exp_value: int) -> Non
     expires_at = datetime.fromtimestamp(exp_value, tz=timezone.utc).replace(tzinfo=None)
     db.add(RevokedToken(jti=jti, token_type=token_type, expires_at=expires_at))
     db.commit()
-
 
 
 def _decode_token(db: Session, token: str, expected_type: str) -> dict:
@@ -356,7 +346,6 @@ def _decode_token(db: Session, token: str, expected_type: str) -> dict:
     return payload
 
 
-
 def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)) -> User:
     payload = _decode_token(db=db, token=token, expected_type="access")
     username = payload["sub"]
@@ -369,7 +358,6 @@ def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
-
 
 
 def get_current_user_or_api_key(
@@ -395,7 +383,6 @@ def get_current_user_or_api_key(
         )
 
     return user
-
 
 
 def require_admin(current_user: User = Depends(get_current_user)) -> User:

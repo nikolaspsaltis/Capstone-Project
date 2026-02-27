@@ -10,6 +10,9 @@ target-version = "py312"
 select = ["E", "F", "I"]
 ignore = []
 
+[tool.ruff.lint.per-file-ignores]
+"tests/conftest.py" = ["E402"]
+
 [tool.pytest.ini_options]
 addopts = "-q --cov=app --cov-report=term-missing --cov-fail-under=80"
 testpaths = ["tests"]

@@ -2,7 +2,7 @@
 import base64
 import json
 import time
-from urllib import request, error
+from urllib import error, request
 
 BASE_URL = "http://127.0.0.1:8000"
 USERNAME = f"tamper_user_{int(time.time())}"
@@ -52,9 +52,7 @@ def tamper_token(token: str) -> str:
 
 def main() -> None:
     post_json("/register", {"username": USERNAME, "password": PASSWORD})
-    login_status, login_body = post_json(
-        "/login", {"username": USERNAME, "password": PASSWORD}
-    )
+    login_status, login_body = post_json("/login", {"username": USERNAME, "password": PASSWORD})
     if login_status != 200:
         print(f"[-] Failed to get baseline token. status={login_status}, body={login_body}")
         return
