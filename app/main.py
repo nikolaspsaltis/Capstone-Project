@@ -1,8 +1,15 @@
+import base64
 import hashlib
+import hmac
+import json
 import logging
 import os
 import secrets
+import struct
+import time
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Annotated, Optional
 from uuid import uuid4
 
@@ -15,6 +22,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, ConfigDict, StringConstraints
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Integer,
@@ -33,6 +41,7 @@ from sqlalchemy.orm import Session, declarative_base, sessionmaker
 # -------------------------
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 auth_logger = logging.getLogger("capstone.auth")
+ops_logger = logging.getLogger("capstone.ops")
 
 SECRET_KEY = os.getenv("JWT_SECRET", "")
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
@@ -40,6 +49,7 @@ JWT_ISSUER = os.getenv("JWT_ISSUER", "capstone-project")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "capstone-client")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "30"))
 REFRESH_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_REFRESH_EXPIRE_MINUTES", "10080"))
+PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = int(os.getenv("PASSWORD_RESET_TOKEN_EXPIRE_MINUTES", "15"))
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
 
 if not SECRET_KEY or SECRET_KEY == "change-this-secret-in-production":
@@ -88,6 +98,37 @@ class User(Base):
     failed_login_attempts = Column(Integer, nullable=False, default=0)
     locked_until = Column(DateTime, nullable=True)
     refresh_token_version = Column(Integer, nullable=False, default=0)
+    mfa_enabled = Column(Boolean, nullable=False, default=False)
+    mfa_secret = Column(String, nullable=True)
+    mfa_temp_secret = Column(String, nullable=True)
+
+
+class APIKey(Base):
+    __tablename__ = "api_keys"
+    __table_args__ = (UniqueConstraint("key_hash", name="uq_api_key_hash"),)
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+    key_hash = Column(String, nullable=False, index=True)
+    key_prefix = Column(String, nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_by = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    last_used_at = Column(DateTime, nullable=True)
+    rotated_from_id = Column(Integer, nullable=True)
+    expires_at = Column(DateTime, nullable=True)
+
+
+class PasswordResetToken(Base):
+    __tablename__ = "password_reset_tokens"
+    __table_args__ = (UniqueConstraint("token_hash", name="uq_password_reset_token_hash"),)
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, nullable=False, index=True)
+    token_hash = Column(String, nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
 
 
 class LoginAttempt(Base):
@@ -120,6 +161,14 @@ class RevokedToken(Base):
 
 
 last_cleanup_run: Optional[datetime] = None
+app_start_time = utcnow()
+request_id_ctx: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
+metrics_lock = Lock()
+metrics = {
+    "login_failures": 0,
+    "lockouts": 0,
+    "rate_limit_hits": 0,
+}
 
 
 # -------------------------
@@ -142,22 +191,78 @@ oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="login", auto_error=False
 PASSLIB_BCRYPT_USABLE = hasattr(bcrypt_lib, "__about__")
 
 
+def get_request_id() -> Optional[str]:
+    return request_id_ctx.get()
+
+
+def log_event(logger: logging.Logger, level: int, event: str, **fields) -> None:
+    payload = {
+        "ts": utcnow().isoformat(),
+        "level": logging.getLevelName(level),
+        "event": event,
+        **fields,
+    }
+    logger.log(level, json.dumps(payload, default=str))
+
+
+def increment_metric(name: str, amount: int = 1) -> None:
+    with metrics_lock:
+        metrics[name] = metrics.get(name, 0) + amount
+
+
 def _hash_api_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
 
-VALID_API_KEY_HASHES = {_hash_api_key(key) for key in API_KEYS}
+def _hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
-def has_valid_api_key(api_key: Optional[str]) -> bool:
-    if not api_key:
-        return False
+def _pad_base32(secret: str) -> str:
+    return secret + "=" * ((8 - len(secret) % 8) % 8)
 
-    candidate_hash = _hash_api_key(api_key)
-    for key_hash in VALID_API_KEY_HASHES:
-        if secrets.compare_digest(candidate_hash, key_hash):
+
+def generate_totp_secret() -> str:
+    return base64.b32encode(secrets.token_bytes(20)).decode("utf-8").rstrip("=")
+
+
+def generate_totp_code(secret: str, for_timestamp: int) -> str:
+    key = base64.b32decode(_pad_base32(secret), casefold=True)
+    counter = for_timestamp // 30
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    binary = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    code = binary % 1_000_000
+    return f"{code:06d}"
+
+
+def verify_totp_code(secret: str, code: str, window: int = 1) -> bool:
+    now = int(time.time())
+    for step in range(-window, window + 1):
+        expected = generate_totp_code(secret=secret, for_timestamp=now + step * 30)
+        if secrets.compare_digest(expected, code):
             return True
     return False
+
+
+def get_valid_api_key_record(db: Session, raw_key: str) -> Optional[APIKey]:
+    hashed = _hash_api_key(raw_key)
+    record = (
+        db.execute(
+            select(APIKey).where(
+                APIKey.key_hash == hashed,
+                APIKey.is_active.is_(True),
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if not record:
+        return None
+    if record.expires_at is not None and record.expires_at < utcnow_naive():
+        return None
+    return record
 
 
 def hash_password(password: str) -> str:
@@ -213,6 +318,52 @@ def create_refresh_token(user: User) -> str:
     )
 
 
+def create_api_key_record(
+    db: Session,
+    *,
+    name: str,
+    created_by: str,
+    expires_minutes: Optional[int] = None,
+    rotated_from_id: Optional[int] = None,
+) -> tuple[APIKey, str]:
+    raw_key = f"cap_{secrets.token_urlsafe(32)}"
+    key_hash = _hash_api_key(raw_key)
+    expires_at = (
+        utcnow_naive() + timedelta(minutes=expires_minutes)
+        if expires_minutes is not None and expires_minutes > 0
+        else None
+    )
+    key_record = APIKey(
+        name=name,
+        key_hash=key_hash,
+        key_prefix=raw_key[:12],
+        is_active=True,
+        created_by=created_by,
+        rotated_from_id=rotated_from_id,
+        expires_at=expires_at,
+    )
+    db.add(key_record)
+    db.commit()
+    db.refresh(key_record)
+    return key_record, raw_key
+
+
+def seed_api_keys_from_env(db: Session) -> None:
+    for idx, raw_key in enumerate(API_KEYS, start=1):
+        if get_valid_api_key_record(db=db, raw_key=raw_key):
+            continue
+        db.add(
+            APIKey(
+                name=f"seeded-env-key-{idx}",
+                key_hash=_hash_api_key(raw_key),
+                key_prefix=raw_key[:12],
+                is_active=True,
+                created_by="system",
+            )
+        )
+    db.commit()
+
+
 def get_user_by_username(db: Session, username: str) -> Optional[User]:
     stmt = select(User).where(User.username == username)
     return db.execute(stmt).scalars().first()
@@ -221,12 +372,15 @@ def get_user_by_username(db: Session, username: str) -> Optional[User]:
 def _record_auth_failure(
     db: Session, username: Optional[str], ip_address: str, reason: str
 ) -> None:
-    auth_logger.warning(
-        "AUTH_FAILURE username=%s ip=%s reason=%s ts=%s",
-        username,
-        ip_address,
-        reason,
-        utcnow().isoformat(),
+    increment_metric("login_failures", 1)
+    log_event(
+        logger=auth_logger,
+        level=logging.WARNING,
+        event="auth_failure",
+        username=username,
+        ip_address=ip_address,
+        reason=reason,
+        request_id=get_request_id(),
     )
     db.add(AuthFailureLog(username=username, ip_address=ip_address, reason=reason))
 
@@ -247,6 +401,7 @@ def _check_login_rate_limit(request: Request, db: Session) -> str:
     )
 
     if attempt_count and attempt_count > RATE_LIMIT_MAX_ATTEMPTS:
+        increment_metric("rate_limit_hits", 1)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Too many login attempts from this IP. Try again later.",
@@ -274,6 +429,7 @@ def run_cleanup_jobs(db: Session, force: bool = False) -> dict:
             "revoked_tokens_deleted": 0,
             "auth_failure_logs_deleted": 0,
             "login_attempts_deleted": 0,
+            "password_reset_tokens_deleted": 0,
         }
 
     revoked_deleted = _normalize_rowcount(
@@ -287,6 +443,9 @@ def run_cleanup_jobs(db: Session, force: bool = False) -> dict:
     login_attempts_deleted = _normalize_rowcount(
         db.execute(delete(LoginAttempt).where(LoginAttempt.created_at < login_cutoff)).rowcount
     )
+    password_reset_tokens_deleted = _normalize_rowcount(
+        db.execute(delete(PasswordResetToken).where(PasswordResetToken.expires_at < now)).rowcount
+    )
 
     db.commit()
     last_cleanup_run = now
@@ -296,6 +455,7 @@ def run_cleanup_jobs(db: Session, force: bool = False) -> dict:
         "revoked_tokens_deleted": revoked_deleted,
         "auth_failure_logs_deleted": auth_logs_deleted,
         "login_attempts_deleted": login_attempts_deleted,
+        "password_reset_tokens_deleted": password_reset_tokens_deleted,
     }
 
 
@@ -315,6 +475,7 @@ def _register_auth_failure(
     if user is not None:
         user.failed_login_attempts += 1
         if user.failed_login_attempts >= MAX_LOGIN_ATTEMPTS:
+            increment_metric("lockouts", 1)
             user.locked_until = utcnow_naive() + timedelta(minutes=LOCKOUT_MINUTES)
             user.failed_login_attempts = 0
 
@@ -397,8 +558,12 @@ def get_current_user_or_api_key(
     token: Optional[str] = Depends(oauth2_scheme_optional),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
 ) -> Optional[User]:
-    if has_valid_api_key(x_api_key):
-        return None
+    if x_api_key:
+        api_key_record = get_valid_api_key_record(db=db, raw_key=x_api_key)
+        if api_key_record:
+            api_key_record.last_used_at = utcnow_naive()
+            db.commit()
+            return None
 
     if not token:
         raise HTTPException(status_code=401, detail="Missing JWT or API key")
@@ -435,6 +600,7 @@ class RegisterIn(BaseModel):
 class LoginIn(BaseModel):
     username: Annotated[str, StringConstraints(min_length=1, max_length=64)]
     password: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+    totp_code: Optional[Annotated[str, StringConstraints(min_length=6, max_length=6)]] = None
 
 
 class TokenOut(BaseModel):
@@ -492,6 +658,62 @@ class CleanupOut(BaseModel):
     revoked_tokens_deleted: int
     auth_failure_logs_deleted: int
     login_attempts_deleted: int
+    password_reset_tokens_deleted: int
+
+
+class PasswordResetRequestIn(BaseModel):
+    username: Annotated[str, StringConstraints(min_length=1, max_length=64)]
+
+
+class PasswordResetRequestOut(BaseModel):
+    status: str
+    message: str
+    reset_token: Optional[str] = None
+
+
+class PasswordResetConfirmIn(BaseModel):
+    token: Annotated[str, StringConstraints(min_length=20, max_length=256)]
+    new_password: Annotated[str, StringConstraints(min_length=6, max_length=256)]
+
+
+class MfaCodeIn(BaseModel):
+    code: Annotated[str, StringConstraints(min_length=6, max_length=6)]
+
+
+class MfaSetupOut(BaseModel):
+    status: str
+    secret: str
+    provisioning_uri: str
+
+
+class APIKeyCreateIn(BaseModel):
+    name: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    expires_minutes: Optional[int] = None
+
+
+class APIKeyRotateIn(BaseModel):
+    name: Optional[Annotated[str, StringConstraints(min_length=1, max_length=128)]] = None
+    expires_minutes: Optional[int] = None
+
+
+class APIKeyOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    key_prefix: str
+    is_active: bool
+    created_by: str
+    created_at: datetime
+    last_used_at: Optional[datetime]
+    rotated_from_id: Optional[int]
+    expires_at: Optional[datetime]
+
+
+class APIKeyCreateOut(BaseModel):
+    status: str
+    api_key: str
+    metadata: APIKeyOut
 
 
 # -------------------------
@@ -505,10 +727,54 @@ async def validation_exception_handler(_request: Request, exc: RequestValidation
     return JSONResponse(status_code=400, content={"detail": exc.errors()})
 
 
+@app.middleware("http")
+async def request_context_and_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    token = request_id_ctx.set(request_id)
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        log_event(
+            logger=ops_logger,
+            level=logging.ERROR,
+            event="http_request_error",
+            request_id=request_id,
+            method=request.method,
+            path=request.url.path,
+            client_ip=request.client.host if request.client else "unknown",
+            duration_ms=round((time.perf_counter() - started) * 1000, 2),
+        )
+        raise
+    finally:
+        request_id_ctx.reset(token)
+
+    response.headers["X-Request-ID"] = request_id
+    log_event(
+        logger=ops_logger,
+        level=logging.INFO,
+        event="http_request",
+        request_id=request_id,
+        method=request.method,
+        path=request.url.path,
+        status_code=response.status_code,
+        client_ip=request.client.host if request.client else "unknown",
+        duration_ms=round((time.perf_counter() - started) * 1000, 2),
+    )
+    return response
+
+
 def _validate_required_schema() -> None:
     with engine.connect() as conn:
         table_names = set(inspect(conn).get_table_names())
-    required = {"users", "login_attempts", "auth_failure_logs", "revoked_tokens"}
+    required = {
+        "users",
+        "login_attempts",
+        "auth_failure_logs",
+        "revoked_tokens",
+        "api_keys",
+        "password_reset_tokens",
+    }
     missing = sorted(required - table_names)
     if missing:
         raise RuntimeError(
@@ -517,14 +783,52 @@ def _validate_required_schema() -> None:
         )
 
 
+def check_readiness() -> tuple[bool, str]:
+    try:
+        _validate_required_schema()
+        with SessionLocal() as db:
+            db.execute(select(1))
+        return True, "ready"
+    except Exception as exc:
+        return False, str(exc)
+
+
 @app.on_event("startup")
 def startup_checks() -> None:
     _validate_required_schema()
+    db = SessionLocal()
+    try:
+        seed_api_keys_from_env(db=db)
+    finally:
+        db.close()
 
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz():
+    is_ready, detail = check_readiness()
+    if not is_ready:
+        return JSONResponse(status_code=503, content={"status": "not_ready", "detail": detail})
+    return {"status": "ready"}
+
+
+@app.get("/metrics")
+def get_metrics():
+    with metrics_lock:
+        counters = dict(metrics)
+    return {
+        "uptime_seconds": int((utcnow() - app_start_time).total_seconds()),
+        "counters": counters,
+    }
 
 
 @app.post("/register", status_code=201)
@@ -578,6 +882,26 @@ def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
         )
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
+    if user.role == "admin" and user.mfa_enabled:
+        if not data.totp_code or not user.mfa_secret:
+            _register_auth_failure(
+                user=user,
+                db=db,
+                username=data.username,
+                ip_address=client_ip,
+                reason="missing_mfa_code",
+            )
+            raise HTTPException(status_code=401, detail="MFA code required")
+        if not verify_totp_code(secret=user.mfa_secret, code=data.totp_code):
+            _register_auth_failure(
+                user=user,
+                db=db,
+                username=data.username,
+                ip_address=client_ip,
+                reason="invalid_mfa_code",
+            )
+            raise HTTPException(status_code=401, detail="Invalid MFA code")
+
     _reset_lock_state(user, db)
     access_token = create_access_token(subject=user.username)
     refresh_token = create_refresh_token(user=user)
@@ -622,6 +946,72 @@ def logout(data: RefreshIn, db: Session = Depends(get_db)):
     return {"status": "ok", "message": "Refresh token revoked"}
 
 
+@app.post("/password-reset/request", response_model=PasswordResetRequestOut)
+def password_reset_request(data: PasswordResetRequestIn, db: Session = Depends(get_db)):
+    user = get_user_by_username(db, data.username)
+    if not user:
+        return PasswordResetRequestOut(
+            status="ok",
+            message="If the account exists, a password reset token has been generated.",
+        )
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = _hash_reset_token(raw_token)
+    expires_at = utcnow_naive() + timedelta(minutes=PASSWORD_RESET_TOKEN_EXPIRE_MINUTES)
+    db.add(
+        PasswordResetToken(
+            user_id=user.id,
+            token_hash=token_hash,
+            expires_at=expires_at,
+        )
+    )
+    db.commit()
+
+    # Demo-friendly: return token directly since no email integration exists.
+    return PasswordResetRequestOut(
+        status="ok",
+        message="Password reset token generated.",
+        reset_token=raw_token,
+    )
+
+
+@app.post("/password-reset/confirm")
+def password_reset_confirm(data: PasswordResetConfirmIn, db: Session = Depends(get_db)):
+    if len(data.new_password.encode("utf-8")) > 72:
+        raise HTTPException(
+            status_code=400,
+            detail="Password too long for bcrypt (max 72 bytes)",
+        )
+
+    now = utcnow_naive()
+    token_hash = _hash_reset_token(data.token)
+    reset_row = (
+        db.execute(
+            select(PasswordResetToken).where(
+                PasswordResetToken.token_hash == token_hash,
+                PasswordResetToken.used_at.is_(None),
+                PasswordResetToken.expires_at >= now,
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if not reset_row:
+        raise HTTPException(status_code=400, detail="Invalid or expired reset token")
+
+    user = db.execute(select(User).where(User.id == reset_row.user_id)).scalars().first()
+    if not user:
+        raise HTTPException(status_code=400, detail="Invalid reset token user")
+
+    user.password_hash = hash_password(data.new_password)
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    user.refresh_token_version += 1
+    reset_row.used_at = now
+    db.commit()
+    return {"status": "ok", "message": "Password updated"}
+
+
 @app.get("/profile", response_model=ProfileOut)
 def profile(current_user: User = Depends(get_current_user)):
     return current_user
@@ -636,6 +1026,120 @@ def data(_auth=Depends(get_current_user_or_api_key)):
 def admin_users(_admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     users = db.execute(select(User).order_by(User.id.asc())).scalars().all()
     return users
+
+
+@app.post("/admin/mfa/setup", response_model=MfaSetupOut)
+def admin_mfa_setup(current_admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    secret = generate_totp_secret()
+    current_admin.mfa_temp_secret = secret
+    db.commit()
+    provisioning_uri = (
+        f"otpauth://totp/{JWT_ISSUER}:{current_admin.username}"
+        f"?secret={secret}&issuer={JWT_ISSUER}&algorithm=SHA1&digits=6&period=30"
+    )
+    return MfaSetupOut(status="ok", secret=secret, provisioning_uri=provisioning_uri)
+
+
+@app.post("/admin/mfa/enable")
+def admin_mfa_enable(
+    data: MfaCodeIn,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if not current_admin.mfa_temp_secret:
+        raise HTTPException(status_code=400, detail="MFA setup has not been initialized")
+    if not verify_totp_code(secret=current_admin.mfa_temp_secret, code=data.code):
+        raise HTTPException(status_code=401, detail="Invalid MFA code")
+
+    current_admin.mfa_secret = current_admin.mfa_temp_secret
+    current_admin.mfa_temp_secret = None
+    current_admin.mfa_enabled = True
+    current_admin.refresh_token_version += 1
+    db.commit()
+    return {"status": "ok", "message": "MFA enabled"}
+
+
+@app.post("/admin/mfa/disable")
+def admin_mfa_disable(
+    data: MfaCodeIn,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    if not current_admin.mfa_enabled or not current_admin.mfa_secret:
+        raise HTTPException(status_code=400, detail="MFA is not enabled")
+    if not verify_totp_code(secret=current_admin.mfa_secret, code=data.code):
+        raise HTTPException(status_code=401, detail="Invalid MFA code")
+
+    current_admin.mfa_enabled = False
+    current_admin.mfa_secret = None
+    current_admin.mfa_temp_secret = None
+    current_admin.refresh_token_version += 1
+    db.commit()
+    return {"status": "ok", "message": "MFA disabled"}
+
+
+@app.get("/admin/api-keys", response_model=list[APIKeyOut])
+def admin_list_api_keys(_admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+    keys = db.execute(select(APIKey).order_by(APIKey.id.asc())).scalars().all()
+    return keys
+
+
+@app.post("/admin/api-keys", response_model=APIKeyCreateOut)
+def admin_create_api_key(
+    data: APIKeyCreateIn,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    record, raw_key = create_api_key_record(
+        db=db,
+        name=data.name,
+        created_by=current_admin.username,
+        expires_minutes=data.expires_minutes,
+    )
+    return APIKeyCreateOut(status="ok", api_key=raw_key, metadata=APIKeyOut.model_validate(record))
+
+
+@app.post("/admin/api-keys/{key_id}/rotate", response_model=APIKeyCreateOut)
+def admin_rotate_api_key(
+    key_id: int,
+    data: APIKeyRotateIn,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    existing = db.execute(select(APIKey).where(APIKey.id == key_id)).scalars().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="API key not found")
+    if not existing.is_active:
+        raise HTTPException(status_code=400, detail="API key is already inactive")
+
+    existing.is_active = False
+    db.commit()
+    new_name = data.name if data.name else f"{existing.name}-rotated"
+    record, raw_key = create_api_key_record(
+        db=db,
+        name=new_name,
+        created_by=current_admin.username,
+        expires_minutes=data.expires_minutes,
+        rotated_from_id=existing.id,
+    )
+    return APIKeyCreateOut(status="ok", api_key=raw_key, metadata=APIKeyOut.model_validate(record))
+
+
+@app.post("/admin/api-keys/{key_id}/revoke")
+def admin_revoke_api_key(
+    key_id: int,
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    existing = db.execute(select(APIKey).where(APIKey.id == key_id)).scalars().first()
+    if not existing:
+        raise HTTPException(status_code=404, detail="API key not found")
+    if not existing.is_active:
+        return {"status": "ok", "message": "API key already inactive"}
+
+    existing.is_active = False
+    db.commit()
+    return {"status": "ok", "message": "API key revoked"}
 
 
 @app.post("/admin/users/{username}/unlock")
@@ -684,8 +1188,7 @@ def admin_auth_failures(
     total = db.scalar(count_query) or 0
     offset = (safe_page - 1) * safe_page_size
     logs = db.execute(
-        item_query
-        .order_by(AuthFailureLog.created_at.desc(), AuthFailureLog.id.desc())
+        item_query.order_by(AuthFailureLog.created_at.desc(), AuthFailureLog.id.desc())
         .offset(offset)
         .limit(safe_page_size)
     )

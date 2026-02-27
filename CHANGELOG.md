@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.5.0 - 2026-02-27
+- Added password reset request/confirm flow with one-time reset tokens.
+- Added optional admin MFA/TOTP setup, enable, disable, and enforced MFA on admin login.
+- Added DB-backed API key management endpoints for listing, creation, rotation, and revocation.
+- Added migration `0003_auth_depth_features` for MFA fields and new auth tables.
+- Added tests for password reset, MFA, and API key lifecycle behavior.
+
 ## v0.4.0 - 2026-02-27
 - Removed runtime schema auto-creation/mutation from app startup.
 - Added startup schema validation that requires Alembic-managed tables.

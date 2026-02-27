@@ -7,6 +7,12 @@ FastAPI security capstone API with:
 - account lockout + DB-backed rate limiting
 - auth failure logging
 - refresh token revocation/rotation
+- one-time password reset tokens
+- optional admin MFA/TOTP
+- DB-backed API key metadata and rotation
+- request IDs + structured JSON request logs
+- liveness/readiness split (`/healthz`, `/readyz`)
+- basic auth security metrics (`/metrics`)
 
 ## Quick Start
 
@@ -47,6 +53,7 @@ set +a
 Run the API:
 
 ```bash
+alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
@@ -58,6 +65,7 @@ uvicorn app.main:app --reload
 | `JWT_ALGORITHM` | No | `HS256` | JWT algorithm |
 | `JWT_EXPIRE_MINUTES` | No | `30` | Access token expiry |
 | `JWT_REFRESH_EXPIRE_MINUTES` | No | `10080` | Refresh token expiry |
+| `PASSWORD_RESET_TOKEN_EXPIRE_MINUTES` | No | `15` | Password reset token expiry |
 | `JWT_ISSUER` | No | `capstone-project` | Expected `iss` claim |
 | `JWT_AUDIENCE` | No | `capstone-client` | Expected `aud` claim |
 | `DATABASE_URL` | No | `sqlite:///./app.db` | SQLAlchemy DB URL |
@@ -76,6 +84,9 @@ uvicorn app.main:app --reload
 BASE_URL="http://127.0.0.1:8000"
 
 curl -s "$BASE_URL/health"
+curl -s "$BASE_URL/healthz"
+curl -s "$BASE_URL/readyz"
+curl -s "$BASE_URL/metrics"
 
 curl -s -X POST "$BASE_URL/register" \
   -H "Content-Type: application/json" \
@@ -94,6 +105,16 @@ curl -s "$BASE_URL/data" -H "X-API-Key: capstone-demo-key"
 curl -s -X POST "$BASE_URL/refresh" \
   -H "Content-Type: application/json" \
   -d "{\"refresh_token\":\"$REFRESH_TOKEN\"}"
+
+# Password reset (demo flow; token returned directly)
+RESET_TOKEN=$(curl -s -X POST "$BASE_URL/password-reset/request" \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice"}' \
+  | python -c 'import sys,json; print(json.load(sys.stdin).get("reset_token",""))')
+
+curl -s -X POST "$BASE_URL/password-reset/confirm" \
+  -H "Content-Type: application/json" \
+  -d "{\"token\":\"$RESET_TOKEN\",\"new_password\":\"newsecret123\"}"
 ```
 
 ## Admin Security Operations
@@ -105,6 +126,13 @@ Admin-only endpoints:
 - `GET /admin/auth-failures?page=1&page_size=50&username=&ip_address=&reason=`
 - `POST /admin/users/{username}/revoke-refresh-tokens`
 - `POST /admin/maintenance/cleanup`
+- `POST /admin/mfa/setup`
+- `POST /admin/mfa/enable`
+- `POST /admin/mfa/disable`
+- `GET /admin/api-keys`
+- `POST /admin/api-keys`
+- `POST /admin/api-keys/{key_id}/rotate`
+- `POST /admin/api-keys/{key_id}/revoke`
 
 Example admin flow:
 
@@ -134,6 +162,14 @@ curl -s -X POST "$BASE_URL/admin/users/alice/revoke-refresh-tokens" \
 
 curl -s -X POST "$BASE_URL/admin/maintenance/cleanup" \
   -H "Authorization: Bearer $ADMIN_ACCESS"
+
+NEW_API_KEY=$(curl -s -X POST "$BASE_URL/admin/api-keys" \
+  -H "Authorization: Bearer $ADMIN_ACCESS" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"integration-key"}' \
+  | python -c 'import sys,json; print(json.load(sys.stdin)["api_key"])')
+
+curl -s "$BASE_URL/data" -H "X-API-Key: $NEW_API_KEY"
 ```
 
 ## Development Commands
@@ -144,6 +180,14 @@ Lint/format/test:
 python -m ruff check .
 python -m black --check .
 python -m pytest
+```
+
+Observability checks:
+
+```bash
+curl -i http://127.0.0.1:8000/healthz
+curl -i http://127.0.0.1:8000/readyz
+curl -i http://127.0.0.1:8000/metrics
 ```
 
 Migrations:

@@ -14,6 +14,7 @@ os.environ["JWT_SECRET"] = "test-secret-for-ci"
 os.environ["JWT_ALGORITHM"] = "HS256"
 os.environ["JWT_EXPIRE_MINUTES"] = "30"
 os.environ["JWT_REFRESH_EXPIRE_MINUTES"] = "120"
+os.environ["PASSWORD_RESET_TOKEN_EXPIRE_MINUTES"] = "15"
 os.environ["JWT_ISSUER"] = "capstone-tests"
 os.environ["JWT_AUDIENCE"] = "capstone-tests-client"
 os.environ["DATABASE_URL"] = "sqlite:///./test_app.db"
@@ -33,6 +34,9 @@ from app import main as main_app
 def clean_db():
     main_app.Base.metadata.drop_all(bind=main_app.engine)
     main_app.Base.metadata.create_all(bind=main_app.engine)
+    with main_app.metrics_lock:
+        for key in main_app.metrics:
+            main_app.metrics[key] = 0
     yield
 
 
