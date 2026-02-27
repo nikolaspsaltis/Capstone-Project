@@ -22,6 +22,9 @@ os.environ["MAX_LOGIN_ATTEMPTS"] = "5"
 os.environ["LOCKOUT_MINUTES"] = "15"
 os.environ["RATE_LIMIT_WINDOW_SECONDS"] = "60"
 os.environ["RATE_LIMIT_MAX_ATTEMPTS"] = "3"
+os.environ["AUTH_FAILURE_LOG_RETENTION_DAYS"] = "30"
+os.environ["LOGIN_ATTEMPT_RETENTION_DAYS"] = "7"
+os.environ["CLEANUP_INTERVAL_MINUTES"] = "60"
 
 from app import main as main_app
 

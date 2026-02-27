@@ -66,6 +66,9 @@ uvicorn app.main:app --reload
 | `LOCKOUT_MINUTES` | No | `15` | Lockout duration |
 | `RATE_LIMIT_WINDOW_SECONDS` | No | `60` | Login rate limit window |
 | `RATE_LIMIT_MAX_ATTEMPTS` | No | `10` | Max login attempts per IP per window |
+| `AUTH_FAILURE_LOG_RETENTION_DAYS` | No | `30` | Retention window for auth failure logs |
+| `LOGIN_ATTEMPT_RETENTION_DAYS` | No | `7` | Retention window for login-attempt records |
+| `CLEANUP_INTERVAL_MINUTES` | No | `60` | Minimum interval for automatic cleanup runs |
 
 ## API Smoke Test (Copy/Paste)
 
@@ -99,8 +102,9 @@ Admin-only endpoints:
 
 - `GET /admin/users`
 - `POST /admin/users/{username}/unlock`
-- `GET /admin/auth-failures?limit=50`
+- `GET /admin/auth-failures?page=1&page_size=50&username=&ip_address=&reason=`
 - `POST /admin/users/{username}/revoke-refresh-tokens`
+- `POST /admin/maintenance/cleanup`
 
 Example admin flow:
 
@@ -122,10 +126,13 @@ curl -s "$BASE_URL/admin/users" \
 curl -s -X POST "$BASE_URL/admin/users/alice/unlock" \
   -H "Authorization: Bearer $ADMIN_ACCESS"
 
-curl -s "$BASE_URL/admin/auth-failures?limit=20" \
+curl -s "$BASE_URL/admin/auth-failures?page=1&page_size=20&username=alice" \
   -H "Authorization: Bearer $ADMIN_ACCESS"
 
 curl -s -X POST "$BASE_URL/admin/users/alice/revoke-refresh-tokens" \
+  -H "Authorization: Bearer $ADMIN_ACCESS"
+
+curl -s -X POST "$BASE_URL/admin/maintenance/cleanup" \
   -H "Authorization: Bearer $ADMIN_ACCESS"
 ```
 
@@ -144,6 +151,9 @@ Migrations:
 ```bash
 alembic upgrade head
 ```
+
+Note: the app now relies on Alembic-managed schema and will fail startup if required
+tables are missing.
 
 ## Scripts
 

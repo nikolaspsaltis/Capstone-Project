@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from app import main as main_app
 
 
@@ -55,19 +57,36 @@ def test_admin_can_view_auth_failure_logs(client):
     register(client, "admin", "adminpass", role="admin")
     admin_access = login(client, "admin", "adminpass").json()["access_token"]
 
-    login(client, "ghost", "wrong1")
-    login(client, "ghost", "wrong2")
+    original_limit = main_app.RATE_LIMIT_MAX_ATTEMPTS
+    main_app.RATE_LIMIT_MAX_ATTEMPTS = 100
+    try:
+        login(client, "ghost", "wrong1")
+        login(client, "ghost", "wrong2")
+        login(client, "other", "wrong3")
+    finally:
+        main_app.RATE_LIMIT_MAX_ATTEMPTS = original_limit
 
-    resp = client.get(
-        "/admin/auth-failures?limit=2",
+    page_1 = client.get(
+        "/admin/auth-failures?page=1&page_size=1&username=ghost",
         headers={"Authorization": f"Bearer {admin_access}"},
     )
-    assert resp.status_code == 200
+    assert page_1.status_code == 200
+    body_1 = page_1.json()
+    assert body_1["page"] == 1
+    assert body_1["page_size"] == 1
+    assert body_1["total"] >= 2
+    assert len(body_1["items"]) == 1
+    assert body_1["items"][0]["username"] == "ghost"
 
-    logs = resp.json()
-    assert len(logs) == 2
-    assert all("reason" in row for row in logs)
-    assert all(row["reason"] in {"invalid_credentials", "account_locked"} for row in logs)
+    page_2 = client.get(
+        "/admin/auth-failures?page=2&page_size=1&username=ghost",
+        headers={"Authorization": f"Bearer {admin_access}"},
+    )
+    assert page_2.status_code == 200
+    body_2 = page_2.json()
+    assert body_2["page"] == 2
+    assert len(body_2["items"]) == 1
+    assert body_2["items"][0]["username"] == "ghost"
 
 
 def test_admin_can_revoke_refresh_tokens_by_user(client):
@@ -105,3 +124,63 @@ def test_non_admin_cannot_revoke_refresh_tokens(client):
         headers={"Authorization": f"Bearer {access}"},
     )
     assert resp.status_code == 403
+
+
+def test_admin_cleanup_removes_expired_and_old_records(client):
+    register(client, "admin", "adminpass", role="admin")
+    admin_access = login(client, "admin", "adminpass").json()["access_token"]
+
+    db = main_app.SessionLocal()
+    try:
+        now = main_app.utcnow_naive()
+        db.add(
+            main_app.RevokedToken(
+                jti="expired-jti",
+                token_type="refresh",
+                expires_at=now - timedelta(days=1),
+            )
+        )
+        db.add(
+            main_app.RevokedToken(
+                jti="active-jti",
+                token_type="refresh",
+                expires_at=now + timedelta(days=1),
+            )
+        )
+        db.add(
+            main_app.AuthFailureLog(
+                username="old-user",
+                ip_address="127.0.0.1",
+                reason="invalid_credentials",
+                created_at=now - timedelta(days=main_app.AUTH_FAILURE_LOG_RETENTION_DAYS + 1),
+            )
+        )
+        db.add(
+            main_app.AuthFailureLog(
+                username="fresh-user",
+                ip_address="127.0.0.1",
+                reason="invalid_credentials",
+                created_at=now,
+            )
+        )
+        db.add(
+            main_app.LoginAttempt(
+                ip_address="127.0.0.1",
+                created_at=now - timedelta(days=main_app.LOGIN_ATTEMPT_RETENTION_DAYS + 1),
+            )
+        )
+        db.add(main_app.LoginAttempt(ip_address="127.0.0.1", created_at=now))
+        db.commit()
+    finally:
+        db.close()
+
+    cleanup = client.post(
+        "/admin/maintenance/cleanup",
+        headers={"Authorization": f"Bearer {admin_access}"},
+    )
+    assert cleanup.status_code == 200
+    body = cleanup.json()
+    assert body["status"] == "ok"
+    assert body["revoked_tokens_deleted"] >= 1
+    assert body["auth_failure_logs_deleted"] >= 1
+    assert body["login_attempts_deleted"] >= 1
