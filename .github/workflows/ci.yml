@@ -37,7 +37,17 @@ jobs:
 
       - name: Compile check
         run: |
-          python -m compileall app scripts
+          python -m compileall app scripts tests alembic
+
+      - name: Prepare test schema
+        env:
+          JWT_SECRET: ci-secret-not-for-production
+          JWT_ISSUER: capstone-tests
+          JWT_AUDIENCE: capstone-tests-client
+          DATABASE_URL: sqlite:///./ci_test.db
+          API_KEYS: test-api-key
+        run: |
+          alembic upgrade head
 
       - name: Pytest with coverage
         env:
@@ -57,6 +67,8 @@ jobs:
           DATABASE_URL: sqlite:///./ci_smoke.db
           API_KEYS: capstone-demo-key
         run: |
+          alembic upgrade head
+
           uvicorn app.main:app --host 127.0.0.1 --port 8000 &
           APP_PID=$!
           trap "kill $APP_PID" EXIT
