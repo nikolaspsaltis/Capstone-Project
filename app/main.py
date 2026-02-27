@@ -84,6 +84,7 @@ class User(Base):
     role = Column(String, nullable=False, default="user")
     failed_login_attempts = Column(Integer, nullable=False, default=0)
     locked_until = Column(DateTime, nullable=True)
+    refresh_token_version = Column(Integer, nullable=False, default=0)
 
 
 class LoginAttempt(Base):
@@ -144,6 +145,16 @@ def _ensure_users_schema() -> None:
             )
         if "locked_until" not in existing_cols:
             conn.execute(text("ALTER TABLE users ADD COLUMN locked_until DATETIME"))
+        if "refresh_token_version" not in existing_cols:
+            conn.execute(
+                text("ALTER TABLE users ADD COLUMN refresh_token_version INTEGER DEFAULT 0")
+            )
+            conn.execute(
+                text(
+                    "UPDATE users SET refresh_token_version=0 "
+                    "WHERE refresh_token_version IS NULL"
+                )
+            )
 
 
 _ensure_users_schema()
@@ -203,7 +214,12 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-def _create_token(subject: str, token_type: str, expires_minutes: int) -> str:
+def _create_token(
+    subject: str,
+    token_type: str,
+    expires_minutes: int,
+    refresh_version: Optional[int] = None,
+) -> str:
     issued_at = utcnow()
     expire = issued_at + timedelta(minutes=expires_minutes)
     payload = {
@@ -215,6 +231,8 @@ def _create_token(subject: str, token_type: str, expires_minutes: int) -> str:
         "aud": JWT_AUDIENCE,
         "typ": token_type,
     }
+    if token_type == "refresh":
+        payload["rv"] = refresh_version if refresh_version is not None else 0
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -224,9 +242,12 @@ def create_access_token(subject: str) -> str:
     )
 
 
-def create_refresh_token(subject: str) -> str:
+def create_refresh_token(user: User) -> str:
     return _create_token(
-        subject=subject, token_type="refresh", expires_minutes=REFRESH_TOKEN_EXPIRE_MINUTES
+        subject=user.username,
+        token_type="refresh",
+        expires_minutes=REFRESH_TOKEN_EXPIRE_MINUTES,
+        refresh_version=user.refresh_token_version,
     )
 
 
@@ -346,6 +367,11 @@ def _decode_token(db: Session, token: str, expected_type: str) -> dict:
     return payload
 
 
+def _validate_refresh_token_version(payload: dict, user: User) -> None:
+    if payload.get("rv") != user.refresh_token_version:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+
 def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)) -> User:
     payload = _decode_token(db=db, token=token, expected_type="access")
     username = payload["sub"]
@@ -431,6 +457,22 @@ class UserOut(BaseModel):
     role: str
 
 
+class AuthFailureLogOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    username: Optional[str]
+    ip_address: str
+    reason: str
+    created_at: datetime
+
+
+class AdminActionOut(BaseModel):
+    status: str
+    username: str
+    refresh_token_version: int
+
+
 # -------------------------
 # App
 # -------------------------
@@ -499,7 +541,7 @@ def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
 
     _reset_lock_state(user, db)
     access_token = create_access_token(subject=user.username)
-    refresh_token = create_refresh_token(subject=user.username)
+    refresh_token = create_refresh_token(user=user)
     return TokenOut(access_token=access_token, refresh_token=refresh_token)
 
 
@@ -511,6 +553,7 @@ def refresh_token(data: RefreshIn, db: Session = Depends(get_db)):
     user = get_user_by_username(db, username)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+    _validate_refresh_token_version(payload=payload, user=user)
 
     _revoke_token(
         db=db,
@@ -520,13 +563,17 @@ def refresh_token(data: RefreshIn, db: Session = Depends(get_db)):
     )
 
     new_access_token = create_access_token(subject=user.username)
-    new_refresh_token = create_refresh_token(subject=user.username)
+    new_refresh_token = create_refresh_token(user=user)
     return TokenOut(access_token=new_access_token, refresh_token=new_refresh_token)
 
 
 @app.post("/logout")
 def logout(data: RefreshIn, db: Session = Depends(get_db)):
     payload = _decode_token(db=db, token=data.refresh_token, expected_type="refresh")
+    user = get_user_by_username(db, payload["sub"])
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
+    _validate_refresh_token_version(payload=payload, user=user)
     _revoke_token(
         db=db,
         jti=payload["jti"],
@@ -550,3 +597,60 @@ def data(_auth=Depends(get_current_user_or_api_key)):
 def admin_users(_admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     users = db.execute(select(User).order_by(User.id.asc())).scalars().all()
     return users
+
+
+@app.post("/admin/users/{username}/unlock")
+def admin_unlock_user(
+    username: str,
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    user = get_user_by_username(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.failed_login_attempts = 0
+    user.locked_until = None
+    db.commit()
+
+    return {"status": "ok", "message": f"User '{username}' unlocked"}
+
+
+@app.get("/admin/auth-failures", response_model=list[AuthFailureLogOut])
+def admin_auth_failures(
+    limit: int = 50,
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    safe_limit = max(1, min(limit, 200))
+    logs = (
+        db.execute(
+            select(AuthFailureLog)
+            .order_by(AuthFailureLog.created_at.desc(), AuthFailureLog.id.desc())
+            .limit(safe_limit)
+        )
+        .scalars()
+        .all()
+    )
+    return logs
+
+
+@app.post("/admin/users/{username}/revoke-refresh-tokens", response_model=AdminActionOut)
+def admin_revoke_refresh_tokens(
+    username: str,
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    user = get_user_by_username(db, username)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.refresh_token_version += 1
+    db.commit()
+    db.refresh(user)
+
+    return AdminActionOut(
+        status="ok",
+        username=user.username,
+        refresh_token_version=user.refresh_token_version,
+    )
