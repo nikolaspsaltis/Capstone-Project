@@ -110,6 +110,34 @@ Expected:
 - admin token: list of users
 - non-admin token: `{"detail":"Forbidden"}` with HTTP 403
 
+### Admin unlock user
+```bash
+curl -X POST http://127.0.0.1:8000/admin/users/<username>/unlock \
+  -H "Authorization: Bearer <admin-jwt>"
+```
+Expected:
+```json
+{"status":"ok","message":"User '<username>' unlocked"}
+```
+
+### Admin auth failure logs
+```bash
+curl -X GET "http://127.0.0.1:8000/admin/auth-failures?limit=20" \
+  -H "Authorization: Bearer <admin-jwt>"
+```
+Expected:
+- list of recent authentication failure events
+
+### Admin revoke refresh tokens for user
+```bash
+curl -X POST http://127.0.0.1:8000/admin/users/<username>/revoke-refresh-tokens \
+  -H "Authorization: Bearer <admin-jwt>"
+```
+Expected:
+```json
+{"status":"ok","username":"<username>","refresh_token_version":1}
+```
+
 ## Security Notes
 
 - JWT includes `iss`, `aud`, and `jti` claims; tokens are validated against configured issuer/audience.
