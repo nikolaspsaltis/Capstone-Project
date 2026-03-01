@@ -182,6 +182,16 @@ python -m black --check .
 python -m pytest
 ```
 
+Coverage gate is currently set to `85%` (`--cov-fail-under=85`) and should be
+raised to `90%` once the next set of endpoint and CI smoke tests are stable.
+
+Targeted strategy checks:
+
+```bash
+python -m pytest tests/test_admin_auth_depth_endpoints.py
+python -m pytest tests/test_migrations.py
+```
+
 Observability checks:
 
 ```bash

@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.6.0 - 2026-02-27
+- Added dedicated admin auth-depth endpoint tests in
+  `tests/test_admin_auth_depth_endpoints.py`.
+- Added Alembic migration lifecycle tests (upgrade/downgrade/re-upgrade) in
+  `tests/test_migrations.py`.
+- Added CI smoke regression step for:
+  `scripts/bruteforce_login.py`,
+  `scripts/token_tampering.py`,
+  `scripts/unauthorized_admin_access.py`,
+  `scripts/performance_test.py`.
+- Raised coverage gate from 80% to 85% (`--cov-fail-under=85`) with staged
+  target to move to 90%.
+
 ## v0.5.0 - 2026-02-27
 - Added password reset request/confirm flow with one-time reset tokens.
 - Added optional admin MFA/TOTP setup, enable, disable, and enforced MFA on admin login.

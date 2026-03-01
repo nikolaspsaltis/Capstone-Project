@@ -14,5 +14,5 @@ ignore = []
 "tests/conftest.py" = ["E402"]
 
 [tool.pytest.ini_options]
-addopts = "-q --cov=app --cov-report=term-missing --cov-fail-under=80"
+addopts = "-q --cov=app --cov-report=term-missing --cov-fail-under=85"
 testpaths = ["tests"]
