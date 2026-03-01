@@ -87,3 +87,33 @@ jobs:
 
           curl -fsS http://127.0.0.1:8000/profile -H "Authorization: Bearer $TOKEN"
           curl -fsS http://127.0.0.1:8000/data -H "X-API-Key: capstone-demo-key"
+
+      - name: Security and load regression smoke
+        env:
+          JWT_SECRET: ci-secret-not-for-production
+          JWT_ISSUER: capstone-project
+          JWT_AUDIENCE: capstone-client
+          DATABASE_URL: sqlite:///./ci_regression.db
+          API_KEYS: capstone-demo-key
+        run: |
+          set -euo pipefail
+          alembic upgrade head
+
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+          APP_PID=$!
+          trap "kill $APP_PID" EXIT
+          sleep 3
+
+          python scripts/bruteforce_login.py | tee /tmp/bruteforce.out
+          grep -q "Valid credential found" /tmp/bruteforce.out
+
+          python scripts/token_tampering.py | tee /tmp/token_tampering.out
+          grep -q "PASS: Tampered token was rejected" /tmp/token_tampering.out
+
+          python scripts/unauthorized_admin_access.py | tee /tmp/unauth_admin.out
+          grep -q "PASS: Non-admin user denied admin endpoint" /tmp/unauth_admin.out
+
+          rm -f results/performance_*.csv
+          python scripts/performance_test.py | tee /tmp/perf.out
+          grep -q "CSV written to:" /tmp/perf.out
+          ls results/performance_*.csv >/dev/null
