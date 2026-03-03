@@ -1,0 +1,4 @@
+[+] Performance test complete: 100 requests
+[+] Average latency (ms): 3.633
+[+] Requests per second: 275.166
+[+] CSV written to: results/performance_20260302_182451.csv

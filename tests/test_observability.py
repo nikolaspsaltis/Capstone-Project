@@ -64,4 +64,11 @@ def test_metrics_track_login_failures_lockouts_and_rate_limit_hits(client):
     assert counters["login_failures"] >= main_app.MAX_LOGIN_ATTEMPTS
     assert counters["lockouts"] >= 1
     assert counters["rate_limit_hits"] >= 1
+    assert "http_requests_total" in counters
+    assert "login_successes" in counters
+    assert "jwt_auth_successes" in counters
+    assert "api_key_auth_successes" in counters
+    assert "admin_access_granted" in counters
+    assert "admin_access_denied" in counters
+    assert "audit_events_total" in counters
     assert body["uptime_seconds"] >= 0

@@ -1,0 +1,25 @@
+{
+  "timestamp_utc": "20260302_182627",
+  "runs": [
+    {
+      "script": "scripts/bruteforce_login.py",
+      "exit_code": 1,
+      "log_file": "results/bruteforce_login_20260302_182627.log"
+    },
+    {
+      "script": "scripts/token_tampering.py",
+      "exit_code": 1,
+      "log_file": "results/token_tampering_20260302_182627.log"
+    },
+    {
+      "script": "scripts/unauthorized_admin_access.py",
+      "exit_code": 1,
+      "log_file": "results/unauthorized_admin_access_20260302_182627.log"
+    },
+    {
+      "script": "scripts/performance_test.py",
+      "exit_code": 1,
+      "log_file": "results/performance_test_20260302_182627.log"
+    }
+  ]
+}

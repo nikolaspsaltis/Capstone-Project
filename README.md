@@ -124,6 +124,7 @@ Admin-only endpoints:
 - `GET /admin/users`
 - `POST /admin/users/{username}/unlock`
 - `GET /admin/auth-failures?page=1&page_size=50&username=&ip_address=&reason=`
+- `GET /admin/audit-logs?page=1&page_size=50&actor_username=&actor_role=&action=&status=&target_username=`
 - `POST /admin/users/{username}/revoke-refresh-tokens`
 - `POST /admin/maintenance/cleanup`
 - `POST /admin/mfa/setup`
@@ -157,6 +158,9 @@ curl -s -X POST "$BASE_URL/admin/users/alice/unlock" \
 curl -s "$BASE_URL/admin/auth-failures?page=1&page_size=20&username=alice" \
   -H "Authorization: Bearer $ADMIN_ACCESS"
 
+curl -s "$BASE_URL/admin/audit-logs?page=1&page_size=20&action=login&status=success" \
+  -H "Authorization: Bearer $ADMIN_ACCESS"
+
 curl -s -X POST "$BASE_URL/admin/users/alice/revoke-refresh-tokens" \
   -H "Authorization: Bearer $ADMIN_ACCESS"
 
@@ -178,7 +182,7 @@ Lint/format/test:
 
 ```bash
 python -m ruff check .
-python -m black --check .
+python -m black --check --quiet .
 python -m pytest
 ```
 
@@ -192,6 +196,19 @@ python -m pytest tests/test_admin_auth_depth_endpoints.py
 python -m pytest tests/test_migrations.py
 ```
 
+## Python 3.13 Readiness Plan
+
+Current warnings come from dependency internals, not failing behavior:
+
+- `fastapi` startup hook deprecation:
+  - Status: addressed by migrating app startup to FastAPI lifespan in `app/main.py`.
+- `python-jose` UTC datetime deprecation warning:
+  - Current pin: `python-jose[cryptography]==3.3.0`.
+  - Plan: evaluate migration to `PyJWT` if upstream does not resolve Python 3.13 warnings.
+- `passlib` `crypt` deprecation warning:
+  - Current pin: `passlib==1.7.4`, `bcrypt==4.0.1`.
+  - Plan: replace passlib usage with direct `bcrypt` path (already available in code as fallback), then remove passlib dependency in a dedicated migration PR.
+
 Observability checks:
 
 ```bash
@@ -199,6 +216,13 @@ curl -i http://127.0.0.1:8000/healthz
 curl -i http://127.0.0.1:8000/readyz
 curl -i http://127.0.0.1:8000/metrics
 ```
+
+`/metrics` now includes enriched counters for:
+- HTTP request totals and error class counts
+- login success/failure and lockout/rate-limit events
+- JWT/API-key authentication successes
+- admin access granted/denied counts
+- total audit events written
 
 Migrations:
 
@@ -215,7 +239,14 @@ tables are missing.
 - `scripts/token_tampering.py`
 - `scripts/unauthorized_admin_access.py`
 - `scripts/performance_test.py`
+- `scripts/run_capstone_evaluation.py`
 - `scripts/create_release_tag.sh`
+
+Reproducible capstone evidence run (writes timestamped artifacts to `results/`):
+
+```bash
+python scripts/run_capstone_evaluation.py
+```
 
 ## Release
 

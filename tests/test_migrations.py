@@ -59,10 +59,11 @@ def test_migration_upgrade_head_creates_auth_depth_schema(tmp_path):
 
     run_alembic(db_url, "upgrade", "head")
 
-    assert current_revision(db_path) == "0003_auth_depth_features"
+    assert current_revision(db_path) == "0004_add_audit_logs"
     assert table_exists(db_path, "users")
     assert table_exists(db_path, "api_keys")
     assert table_exists(db_path, "password_reset_tokens")
+    assert table_exists(db_path, "audit_logs")
     assert column_exists(db_path, "users", "mfa_enabled")
     assert column_exists(db_path, "users", "mfa_secret")
     assert column_exists(db_path, "users", "mfa_temp_secret")
@@ -79,9 +80,11 @@ def test_migration_downgrade_base_then_reupgrade(tmp_path):
     assert not table_exists(db_path, "users")
     assert not table_exists(db_path, "api_keys")
     assert not table_exists(db_path, "password_reset_tokens")
+    assert not table_exists(db_path, "audit_logs")
 
     run_alembic(db_url, "upgrade", "head")
-    assert current_revision(db_path) == "0003_auth_depth_features"
+    assert current_revision(db_path) == "0004_add_audit_logs"
     assert table_exists(db_path, "users")
     assert table_exists(db_path, "api_keys")
     assert table_exists(db_path, "password_reset_tokens")
+    assert table_exists(db_path, "audit_logs")

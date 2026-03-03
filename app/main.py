@@ -7,6 +7,7 @@ import os
 import secrets
 import struct
 import time
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from threading import Lock
@@ -27,6 +28,7 @@ from sqlalchemy import (
     DateTime,
     Integer,
     String,
+    Text,
     UniqueConstraint,
     create_engine,
     delete,
@@ -149,6 +151,20 @@ class AuthFailureLog(Base):
     created_at = Column(DateTime, nullable=False, default=utcnow_naive)
 
 
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id = Column(Integer, primary_key=True)
+    actor_username = Column(String, nullable=True, index=True)
+    actor_role = Column(String, nullable=True)
+    action = Column(String, nullable=False, index=True)
+    status = Column(String, nullable=False)
+    target_username = Column(String, nullable=True, index=True)
+    ip_address = Column(String, nullable=False, index=True)
+    details = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=utcnow_naive, index=True)
+
+
 class RevokedToken(Base):
     __tablename__ = "revoked_tokens"
     __table_args__ = (UniqueConstraint("jti", name="uq_revoked_token_jti"),)
@@ -165,9 +181,19 @@ app_start_time = utcnow()
 request_id_ctx: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
 metrics_lock = Lock()
 metrics = {
+    "http_requests_total": 0,
+    "http_request_errors": 0,
+    "http_4xx_responses": 0,
+    "http_5xx_responses": 0,
     "login_failures": 0,
+    "login_successes": 0,
     "lockouts": 0,
     "rate_limit_hits": 0,
+    "jwt_auth_successes": 0,
+    "api_key_auth_successes": 0,
+    "admin_access_granted": 0,
+    "admin_access_denied": 0,
+    "audit_events_total": 0,
 }
 
 
@@ -208,6 +234,41 @@ def log_event(logger: logging.Logger, level: int, event: str, **fields) -> None:
 def increment_metric(name: str, amount: int = 1) -> None:
     with metrics_lock:
         metrics[name] = metrics.get(name, 0) + amount
+
+
+def _extract_client_ip(request: Optional[Request]) -> str:
+    if request and request.client and request.client.host:
+        return request.client.host
+    return "unknown"
+
+
+def _write_audit_log(
+    db: Session,
+    *,
+    action: str,
+    status: str,
+    request: Optional[Request] = None,
+    actor_username: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    target_username: Optional[str] = None,
+    details: Optional[dict[str, object]] = None,
+    commit: bool = False,
+) -> None:
+    detail_payload = json.dumps(details, sort_keys=True) if details is not None else None
+    db.add(
+        AuditLog(
+            actor_username=actor_username,
+            actor_role=actor_role,
+            action=action,
+            status=status,
+            target_username=target_username,
+            ip_address=_extract_client_ip(request),
+            details=detail_payload,
+        )
+    )
+    increment_metric("audit_events_total", 1)
+    if commit:
+        db.commit()
 
 
 def _hash_api_key(api_key: str) -> str:
@@ -385,8 +446,8 @@ def _record_auth_failure(
     db.add(AuthFailureLog(username=username, ip_address=ip_address, reason=reason))
 
 
-def _check_login_rate_limit(request: Request, db: Session) -> str:
-    client_ip = request.client.host if request.client and request.client.host else "unknown"
+def _check_login_rate_limit(request: Request, db: Session, username: str) -> str:
+    client_ip = _extract_client_ip(request)
     now = utcnow_naive()
     cutoff = now - timedelta(seconds=RATE_LIMIT_WINDOW_SECONDS)
 
@@ -402,6 +463,16 @@ def _check_login_rate_limit(request: Request, db: Session) -> str:
 
     if attempt_count and attempt_count > RATE_LIMIT_MAX_ATTEMPTS:
         increment_metric("rate_limit_hits", 1)
+        _write_audit_log(
+            db=db,
+            action="login",
+            status="rate_limited",
+            request=request,
+            actor_username=username,
+            target_username=username,
+            details={"reason": "rate_limit"},
+            commit=True,
+        )
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Too many login attempts from this IP. Try again later.",
@@ -550,6 +621,7 @@ def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_
             detail="Invalid or expired token",
             headers={"WWW-Authenticate": "Bearer"},
         )
+    increment_metric("jwt_auth_successes", 1)
     return user
 
 
@@ -563,6 +635,7 @@ def get_current_user_or_api_key(
         if api_key_record:
             api_key_record.last_used_at = utcnow_naive()
             db.commit()
+            increment_metric("api_key_auth_successes", 1)
             return None
 
     if not token:
@@ -579,12 +652,29 @@ def get_current_user_or_api_key(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    increment_metric("jwt_auth_successes", 1)
     return user
 
 
-def require_admin(current_user: User = Depends(get_current_user)) -> User:
+def require_admin(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> User:
     if current_user.role != "admin":
+        increment_metric("admin_access_denied", 1)
+        _write_audit_log(
+            db=db,
+            action="admin_access",
+            status="denied",
+            request=request,
+            actor_username=current_user.username,
+            actor_role=current_user.role,
+            details={"path": request.url.path},
+            commit=True,
+        )
         raise HTTPException(status_code=403, detail="Forbidden")
+    increment_metric("admin_access_granted", 1)
     return current_user
 
 
@@ -641,6 +731,27 @@ class AuthFailureLogOut(BaseModel):
 
 class AuthFailureLogPageOut(BaseModel):
     items: list[AuthFailureLogOut]
+    page: int
+    page_size: int
+    total: int
+
+
+class AuditLogOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    actor_username: Optional[str]
+    actor_role: Optional[str]
+    action: str
+    status: str
+    target_username: Optional[str]
+    ip_address: str
+    details: Optional[str]
+    created_at: datetime
+
+
+class AuditLogPageOut(BaseModel):
+    items: list[AuditLogOut]
     page: int
     page_size: int
     total: int
@@ -719,7 +830,22 @@ class APIKeyCreateOut(BaseModel):
 # -------------------------
 # App
 # -------------------------
-app = FastAPI(title="Secure API Capstone Starter")
+def startup_checks() -> None:
+    _validate_required_schema()
+    db = SessionLocal()
+    try:
+        seed_api_keys_from_env(db=db)
+    finally:
+        db.close()
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    startup_checks()
+    yield
+
+
+app = FastAPI(title="Secure API Capstone Starter", lifespan=lifespan)
 
 
 @app.exception_handler(RequestValidationError)
@@ -735,6 +861,7 @@ async def request_context_and_logging_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
     except Exception:
+        increment_metric("http_request_errors", 1)
         log_event(
             logger=ops_logger,
             level=logging.ERROR,
@@ -748,6 +875,12 @@ async def request_context_and_logging_middleware(request: Request, call_next):
         raise
     finally:
         request_id_ctx.reset(token)
+
+    increment_metric("http_requests_total", 1)
+    if 400 <= response.status_code < 500:
+        increment_metric("http_4xx_responses", 1)
+    if response.status_code >= 500:
+        increment_metric("http_5xx_responses", 1)
 
     response.headers["X-Request-ID"] = request_id
     log_event(
@@ -771,6 +904,7 @@ def _validate_required_schema() -> None:
         "users",
         "login_attempts",
         "auth_failure_logs",
+        "audit_logs",
         "revoked_tokens",
         "api_keys",
         "password_reset_tokens",
@@ -791,16 +925,6 @@ def check_readiness() -> tuple[bool, str]:
         return True, "ready"
     except Exception as exc:
         return False, str(exc)
-
-
-@app.on_event("startup")
-def startup_checks() -> None:
-    _validate_required_schema()
-    db = SessionLocal()
-    try:
-        seed_api_keys_from_env(db=db)
-    finally:
-        db.close()
 
 
 @app.get("/health")
@@ -832,7 +956,7 @@ def get_metrics():
 
 
 @app.post("/register", status_code=201)
-def register(data: RegisterIn, db: Session = Depends(get_db)):
+def register(data: RegisterIn, request: Request, db: Session = Depends(get_db)):
     if len(data.password.encode("utf-8")) > 72:
         raise HTTPException(
             status_code=400,
@@ -841,6 +965,15 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
 
     existing = get_user_by_username(db, data.username)
     if existing:
+        _write_audit_log(
+            db=db,
+            action="register",
+            status="failed_duplicate",
+            request=request,
+            actor_username=data.username,
+            target_username=data.username,
+            commit=True,
+        )
         raise HTTPException(status_code=400, detail="Username already exists")
 
     role = data.role if data.role in {"user", "admin"} else "user"
@@ -853,13 +986,23 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
     db.add(user)
     db.commit()
     db.refresh(user)
+    _write_audit_log(
+        db=db,
+        action="register",
+        status="success",
+        request=request,
+        actor_username=user.username,
+        actor_role=user.role,
+        target_username=user.username,
+        commit=True,
+    )
     return {"id": user.id, "username": user.username, "role": user.role}
 
 
 @app.post("/login", response_model=TokenOut)
 def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
     run_cleanup_jobs(db=db, force=False)
-    client_ip = _check_login_rate_limit(request=request, db=db)
+    client_ip = _check_login_rate_limit(request=request, db=db, username=data.username)
 
     user = get_user_by_username(db, data.username)
     if user and _is_user_locked(user):
@@ -870,6 +1013,16 @@ def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
             ip_address=client_ip,
             reason="account_locked",
         )
+        _write_audit_log(
+            db=db,
+            action="login",
+            status="failed_locked",
+            request=request,
+            actor_username=data.username,
+            actor_role=user.role,
+            target_username=data.username,
+            commit=True,
+        )
         raise HTTPException(status_code=403, detail="Account locked. Try again later.")
 
     if not user or not verify_password(data.password, user.password_hash):
@@ -879,6 +1032,15 @@ def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
             username=data.username,
             ip_address=client_ip,
             reason="invalid_credentials",
+        )
+        _write_audit_log(
+            db=db,
+            action="login",
+            status="failed_invalid_credentials",
+            request=request,
+            actor_username=data.username,
+            target_username=data.username,
+            commit=True,
         )
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
@@ -891,6 +1053,16 @@ def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
                 ip_address=client_ip,
                 reason="missing_mfa_code",
             )
+            _write_audit_log(
+                db=db,
+                action="login",
+                status="failed_missing_mfa_code",
+                request=request,
+                actor_username=data.username,
+                actor_role=user.role,
+                target_username=data.username,
+                commit=True,
+            )
             raise HTTPException(status_code=401, detail="MFA code required")
         if not verify_totp_code(secret=user.mfa_secret, code=data.totp_code):
             _register_auth_failure(
@@ -900,21 +1072,51 @@ def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
                 ip_address=client_ip,
                 reason="invalid_mfa_code",
             )
+            _write_audit_log(
+                db=db,
+                action="login",
+                status="failed_invalid_mfa_code",
+                request=request,
+                actor_username=data.username,
+                actor_role=user.role,
+                target_username=data.username,
+                commit=True,
+            )
             raise HTTPException(status_code=401, detail="Invalid MFA code")
 
     _reset_lock_state(user, db)
     access_token = create_access_token(subject=user.username)
     refresh_token = create_refresh_token(user=user)
+    increment_metric("login_successes", 1)
+    _write_audit_log(
+        db=db,
+        action="login",
+        status="success",
+        request=request,
+        actor_username=user.username,
+        actor_role=user.role,
+        target_username=user.username,
+        commit=True,
+    )
     return TokenOut(access_token=access_token, refresh_token=refresh_token)
 
 
 @app.post("/refresh", response_model=TokenOut)
-def refresh_token(data: RefreshIn, db: Session = Depends(get_db)):
+def refresh_token(data: RefreshIn, request: Request, db: Session = Depends(get_db)):
     payload = _decode_token(db=db, token=data.refresh_token, expected_type="refresh")
 
     username = payload["sub"]
     user = get_user_by_username(db, username)
     if not user:
+        _write_audit_log(
+            db=db,
+            action="refresh_token",
+            status="failed_invalid_user",
+            request=request,
+            actor_username=username,
+            target_username=username,
+            commit=True,
+        )
         raise HTTPException(status_code=401, detail="Invalid refresh token")
     _validate_refresh_token_version(payload=payload, user=user)
 
@@ -927,14 +1129,33 @@ def refresh_token(data: RefreshIn, db: Session = Depends(get_db)):
 
     new_access_token = create_access_token(subject=user.username)
     new_refresh_token = create_refresh_token(user=user)
+    _write_audit_log(
+        db=db,
+        action="refresh_token",
+        status="success",
+        request=request,
+        actor_username=user.username,
+        actor_role=user.role,
+        target_username=user.username,
+        commit=True,
+    )
     return TokenOut(access_token=new_access_token, refresh_token=new_refresh_token)
 
 
 @app.post("/logout")
-def logout(data: RefreshIn, db: Session = Depends(get_db)):
+def logout(data: RefreshIn, request: Request, db: Session = Depends(get_db)):
     payload = _decode_token(db=db, token=data.refresh_token, expected_type="refresh")
     user = get_user_by_username(db, payload["sub"])
     if not user:
+        _write_audit_log(
+            db=db,
+            action="logout",
+            status="failed_invalid_user",
+            request=request,
+            actor_username=payload["sub"],
+            target_username=payload["sub"],
+            commit=True,
+        )
         raise HTTPException(status_code=401, detail="Invalid refresh token")
     _validate_refresh_token_version(payload=payload, user=user)
     _revoke_token(
@@ -943,13 +1164,34 @@ def logout(data: RefreshIn, db: Session = Depends(get_db)):
         token_type="refresh",
         exp_value=payload["exp"],
     )
+    _write_audit_log(
+        db=db,
+        action="logout",
+        status="success",
+        request=request,
+        actor_username=user.username,
+        actor_role=user.role,
+        target_username=user.username,
+        commit=True,
+    )
     return {"status": "ok", "message": "Refresh token revoked"}
 
 
 @app.post("/password-reset/request", response_model=PasswordResetRequestOut)
-def password_reset_request(data: PasswordResetRequestIn, db: Session = Depends(get_db)):
+def password_reset_request(
+    data: PasswordResetRequestIn, request: Request, db: Session = Depends(get_db)
+):
     user = get_user_by_username(db, data.username)
     if not user:
+        _write_audit_log(
+            db=db,
+            action="password_reset_request",
+            status="accepted_unknown_user",
+            request=request,
+            actor_username=data.username,
+            target_username=data.username,
+            commit=True,
+        )
         return PasswordResetRequestOut(
             status="ok",
             message="If the account exists, a password reset token has been generated.",
@@ -966,6 +1208,16 @@ def password_reset_request(data: PasswordResetRequestIn, db: Session = Depends(g
         )
     )
     db.commit()
+    _write_audit_log(
+        db=db,
+        action="password_reset_request",
+        status="success",
+        request=request,
+        actor_username=user.username,
+        actor_role=user.role,
+        target_username=user.username,
+        commit=True,
+    )
 
     # Demo-friendly: return token directly since no email integration exists.
     return PasswordResetRequestOut(
@@ -976,7 +1228,9 @@ def password_reset_request(data: PasswordResetRequestIn, db: Session = Depends(g
 
 
 @app.post("/password-reset/confirm")
-def password_reset_confirm(data: PasswordResetConfirmIn, db: Session = Depends(get_db)):
+def password_reset_confirm(
+    data: PasswordResetConfirmIn, request: Request, db: Session = Depends(get_db)
+):
     if len(data.new_password.encode("utf-8")) > 72:
         raise HTTPException(
             status_code=400,
@@ -997,10 +1251,24 @@ def password_reset_confirm(data: PasswordResetConfirmIn, db: Session = Depends(g
         .first()
     )
     if not reset_row:
+        _write_audit_log(
+            db=db,
+            action="password_reset_confirm",
+            status="failed_invalid_or_expired_token",
+            request=request,
+            commit=True,
+        )
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
 
     user = db.execute(select(User).where(User.id == reset_row.user_id)).scalars().first()
     if not user:
+        _write_audit_log(
+            db=db,
+            action="password_reset_confirm",
+            status="failed_invalid_user",
+            request=request,
+            commit=True,
+        )
         raise HTTPException(status_code=400, detail="Invalid reset token user")
 
     user.password_hash = hash_password(data.new_password)
@@ -1009,6 +1277,16 @@ def password_reset_confirm(data: PasswordResetConfirmIn, db: Session = Depends(g
     user.refresh_token_version += 1
     reset_row.used_at = now
     db.commit()
+    _write_audit_log(
+        db=db,
+        action="password_reset_confirm",
+        status="success",
+        request=request,
+        actor_username=user.username,
+        actor_role=user.role,
+        target_username=user.username,
+        commit=True,
+    )
     return {"status": "ok", "message": "Password updated"}
 
 
@@ -1023,8 +1301,16 @@ def data(_auth=Depends(get_current_user_or_api_key)):
 
 
 @app.get("/admin/users", response_model=list[UserOut])
-def admin_users(_admin: User = Depends(require_admin), db: Session = Depends(get_db)):
+def admin_users(current_admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     users = db.execute(select(User).order_by(User.id.asc())).scalars().all()
+    _write_audit_log(
+        db=db,
+        action="admin_list_users",
+        status="success",
+        actor_username=current_admin.username,
+        actor_role=current_admin.role,
+        commit=True,
+    )
     return users
 
 
@@ -1033,6 +1319,15 @@ def admin_mfa_setup(current_admin: User = Depends(require_admin), db: Session = 
     secret = generate_totp_secret()
     current_admin.mfa_temp_secret = secret
     db.commit()
+    _write_audit_log(
+        db=db,
+        action="admin_mfa_setup",
+        status="success",
+        actor_username=current_admin.username,
+        actor_role=current_admin.role,
+        target_username=current_admin.username,
+        commit=True,
+    )
     provisioning_uri = (
         f"otpauth://totp/{JWT_ISSUER}:{current_admin.username}"
         f"?secret={secret}&issuer={JWT_ISSUER}&algorithm=SHA1&digits=6&period=30"
@@ -1056,6 +1351,15 @@ def admin_mfa_enable(
     current_admin.mfa_enabled = True
     current_admin.refresh_token_version += 1
     db.commit()
+    _write_audit_log(
+        db=db,
+        action="admin_mfa_enable",
+        status="success",
+        actor_username=current_admin.username,
+        actor_role=current_admin.role,
+        target_username=current_admin.username,
+        commit=True,
+    )
     return {"status": "ok", "message": "MFA enabled"}
 
 
@@ -1075,6 +1379,15 @@ def admin_mfa_disable(
     current_admin.mfa_temp_secret = None
     current_admin.refresh_token_version += 1
     db.commit()
+    _write_audit_log(
+        db=db,
+        action="admin_mfa_disable",
+        status="success",
+        actor_username=current_admin.username,
+        actor_role=current_admin.role,
+        target_username=current_admin.username,
+        commit=True,
+    )
     return {"status": "ok", "message": "MFA disabled"}
 
 
@@ -1095,6 +1408,15 @@ def admin_create_api_key(
         name=data.name,
         created_by=current_admin.username,
         expires_minutes=data.expires_minutes,
+    )
+    _write_audit_log(
+        db=db,
+        action="admin_api_key_create",
+        status="success",
+        actor_username=current_admin.username,
+        actor_role=current_admin.role,
+        details={"key_id": record.id, "name": record.name},
+        commit=True,
     )
     return APIKeyCreateOut(status="ok", api_key=raw_key, metadata=APIKeyOut.model_validate(record))
 
@@ -1122,6 +1444,15 @@ def admin_rotate_api_key(
         expires_minutes=data.expires_minutes,
         rotated_from_id=existing.id,
     )
+    _write_audit_log(
+        db=db,
+        action="admin_api_key_rotate",
+        status="success",
+        actor_username=current_admin.username,
+        actor_role=current_admin.role,
+        details={"old_key_id": existing.id, "new_key_id": record.id},
+        commit=True,
+    )
     return APIKeyCreateOut(status="ok", api_key=raw_key, metadata=APIKeyOut.model_validate(record))
 
 
@@ -1135,10 +1466,28 @@ def admin_revoke_api_key(
     if not existing:
         raise HTTPException(status_code=404, detail="API key not found")
     if not existing.is_active:
+        _write_audit_log(
+            db=db,
+            action="admin_api_key_revoke",
+            status="already_inactive",
+            actor_username=_admin.username,
+            actor_role=_admin.role,
+            details={"key_id": existing.id},
+            commit=True,
+        )
         return {"status": "ok", "message": "API key already inactive"}
 
     existing.is_active = False
     db.commit()
+    _write_audit_log(
+        db=db,
+        action="admin_api_key_revoke",
+        status="success",
+        actor_username=_admin.username,
+        actor_role=_admin.role,
+        details={"key_id": existing.id},
+        commit=True,
+    )
     return {"status": "ok", "message": "API key revoked"}
 
 
@@ -1155,6 +1504,15 @@ def admin_unlock_user(
     user.failed_login_attempts = 0
     user.locked_until = None
     db.commit()
+    _write_audit_log(
+        db=db,
+        action="admin_unlock_user",
+        status="success",
+        actor_username=_admin.username,
+        actor_role=_admin.role,
+        target_username=user.username,
+        commit=True,
+    )
 
     return {"status": "ok", "message": f"User '{username}' unlocked"}
 
@@ -1200,6 +1558,53 @@ def admin_auth_failures(
     )
 
 
+@app.get("/admin/audit-logs", response_model=AuditLogPageOut)
+def admin_audit_logs(
+    page: int = 1,
+    page_size: int = 50,
+    actor_username: Optional[str] = None,
+    actor_role: Optional[str] = None,
+    action: Optional[str] = None,
+    status: Optional[str] = None,
+    target_username: Optional[str] = None,
+    _admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    safe_page = max(1, page)
+    safe_page_size = max(1, min(page_size, 200))
+    conditions = []
+    if actor_username:
+        conditions.append(AuditLog.actor_username == actor_username)
+    if actor_role:
+        conditions.append(AuditLog.actor_role == actor_role)
+    if action:
+        conditions.append(AuditLog.action == action)
+    if status:
+        conditions.append(AuditLog.status == status)
+    if target_username:
+        conditions.append(AuditLog.target_username == target_username)
+
+    item_query = select(AuditLog)
+    count_query = select(func.count()).select_from(AuditLog)
+    if conditions:
+        item_query = item_query.where(*conditions)
+        count_query = count_query.where(*conditions)
+
+    total = db.scalar(count_query) or 0
+    offset = (safe_page - 1) * safe_page_size
+    logs = db.execute(
+        item_query.order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .offset(offset)
+        .limit(safe_page_size)
+    )
+    return AuditLogPageOut(
+        items=logs.scalars().all(),
+        page=safe_page,
+        page_size=safe_page_size,
+        total=int(total),
+    )
+
+
 @app.post("/admin/users/{username}/revoke-refresh-tokens", response_model=AdminActionOut)
 def admin_revoke_refresh_tokens(
     username: str,
@@ -1213,6 +1618,16 @@ def admin_revoke_refresh_tokens(
     user.refresh_token_version += 1
     db.commit()
     db.refresh(user)
+    _write_audit_log(
+        db=db,
+        action="admin_revoke_refresh_tokens",
+        status="success",
+        actor_username=_admin.username,
+        actor_role=_admin.role,
+        target_username=user.username,
+        details={"refresh_token_version": user.refresh_token_version},
+        commit=True,
+    )
 
     return AdminActionOut(
         status="ok",
@@ -1227,4 +1642,18 @@ def admin_cleanup_maintenance(
     db: Session = Depends(get_db),
 ):
     result = run_cleanup_jobs(db=db, force=True)
+    _write_audit_log(
+        db=db,
+        action="admin_cleanup_maintenance",
+        status=result.get("status", "ok"),
+        actor_username=_admin.username,
+        actor_role=_admin.role,
+        details={
+            "revoked_tokens_deleted": result.get("revoked_tokens_deleted", 0),
+            "auth_failure_logs_deleted": result.get("auth_failure_logs_deleted", 0),
+            "login_attempts_deleted": result.get("login_attempts_deleted", 0),
+            "password_reset_tokens_deleted": result.get("password_reset_tokens_deleted", 0),
+        },
+        commit=True,
+    )
     return CleanupOut(**result)
