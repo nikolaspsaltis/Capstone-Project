@@ -1,6 +1,0 @@
-[+] Starting brute-force simulation
-Attempt 1: password='password' -> status=401, success=False
-Attempt 2: password='123456' -> status=401, success=False
-Attempt 3: password='letmein' -> status=401, success=False
-Attempt 4: password='secret123' -> status=200, success=True
-[!] Valid credential found. Token prefix: eyJhbGciOiJIUzI1NiIs...
