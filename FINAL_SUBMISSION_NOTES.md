@@ -21,4 +21,4 @@
 
 ## Notes
 - Root path `/` intentionally returns `404` (no root endpoint defined).
-- Remaining warnings are dependency deprecations (`passlib`/`python-jose`) and do not fail checks.
+- `passlib` has been removed from runtime; remaining JWT deprecation warnings are from the `python-jose` path while `JWT_BACKEND=python-jose` is active.
