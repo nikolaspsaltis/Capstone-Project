@@ -30,6 +30,7 @@ def login(client, username: str, password: str, totp_code: str | None = None):
         ("POST", "/admin/api-keys/9999/rotate", {"name": "user-attempt-rotated"}),
         ("POST", "/admin/api-keys/9999/revoke", None),
         ("GET", "/admin/audit-logs", None),
+        ("GET", "/admin/security-alerts", None),
     ],
 )
 def test_non_admin_forbidden_on_new_admin_endpoints(client, method: str, path: str, payload: dict):

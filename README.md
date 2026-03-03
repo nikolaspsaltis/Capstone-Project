@@ -62,6 +62,7 @@ uvicorn app.main:app --reload
 | Variable | Required | Default | Purpose |
 |---|---|---|---|
 | `JWT_SECRET` | Yes | none | Signing secret for JWT tokens |
+| `JWT_BACKEND` | No | `python-jose` | JWT backend selector (`python-jose` or `pyjwt`) |
 | `JWT_ALGORITHM` | No | `HS256` | JWT algorithm |
 | `JWT_EXPIRE_MINUTES` | No | `30` | Access token expiry |
 | `JWT_REFRESH_EXPIRE_MINUTES` | No | `10080` | Refresh token expiry |
@@ -125,6 +126,7 @@ Admin-only endpoints:
 - `POST /admin/users/{username}/unlock`
 - `GET /admin/auth-failures?page=1&page_size=50&username=&ip_address=&reason=`
 - `GET /admin/audit-logs?page=1&page_size=50&actor_username=&actor_role=&action=&status=&target_username=`
+- `GET /admin/security-alerts?window_minutes=60&min_failed_logins=5&min_admin_denials=3`
 - `POST /admin/users/{username}/revoke-refresh-tokens`
 - `POST /admin/maintenance/cleanup`
 - `POST /admin/mfa/setup`
@@ -170,10 +172,13 @@ curl -s -X POST "$BASE_URL/admin/maintenance/cleanup" \
 NEW_API_KEY=$(curl -s -X POST "$BASE_URL/admin/api-keys" \
   -H "Authorization: Bearer $ADMIN_ACCESS" \
   -H "Content-Type: application/json" \
-  -d '{"name":"integration-key"}' \
+  -d '{"name":"integration-key","scopes":["data:read","metrics:read"]}' \
   | python -c 'import sys,json; print(json.load(sys.stdin)["api_key"])')
 
 curl -s "$BASE_URL/data" -H "X-API-Key: $NEW_API_KEY"
+
+curl -s "$BASE_URL/admin/security-alerts?window_minutes=60&min_failed_logins=3" \
+  -H "Authorization: Bearer $ADMIN_ACCESS"
 ```
 
 ## Development Commands
@@ -202,12 +207,12 @@ Current warnings come from dependency internals, not failing behavior:
 
 - `fastapi` startup hook deprecation:
   - Status: addressed by migrating app startup to FastAPI lifespan in `app/main.py`.
-- `python-jose` UTC datetime deprecation warning:
-  - Current pin: `python-jose[cryptography]==3.3.0`.
-  - Plan: evaluate migration to `PyJWT` if upstream does not resolve Python 3.13 warnings.
-- `passlib` `crypt` deprecation warning:
-  - Current pin: `passlib==1.7.4`, `bcrypt==4.0.1`.
-  - Plan: replace passlib usage with direct `bcrypt` path (already available in code as fallback), then remove passlib dependency in a dedicated migration PR.
+- Password hashing:
+  - Status: migrated to direct `bcrypt` only; `passlib` removed from runtime path.
+- JWT migration layer:
+  - Status: app now uses `app/jwt_backend.py` abstraction.
+  - Current default: `JWT_BACKEND=python-jose`.
+  - Migration path: set `JWT_BACKEND=pyjwt` in environment to test/roll over backend without endpoint changes.
 
 Observability checks:
 
@@ -223,6 +228,7 @@ curl -i http://127.0.0.1:8000/metrics
 - JWT/API-key authentication successes
 - admin access granted/denied counts
 - total audit events written
+- active JWT backend label (`jwt_backend`)
 
 Migrations:
 

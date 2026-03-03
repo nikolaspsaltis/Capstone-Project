@@ -60,6 +60,7 @@ def test_metrics_track_login_failures_lockouts_and_rate_limit_hits(client):
     assert metrics.status_code == 200
     body = metrics.json()
     counters = body["counters"]
+    assert body["jwt_backend"] in {"python-jose", "pyjwt"}
 
     assert counters["login_failures"] >= main_app.MAX_LOGIN_ATTEMPTS
     assert counters["lockouts"] >= 1

@@ -19,7 +19,6 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
-from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, ConfigDict, StringConstraints
 from sqlalchemy import (
@@ -37,6 +36,8 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
+
+from app.jwt_backend import TokenDecodeError, decode_jwt, encode_jwt, get_jwt_backend_name
 
 # -------------------------
 # Config
@@ -63,6 +64,12 @@ if not SECRET_KEY or SECRET_KEY == "change-this-secret-in-production":
 API_KEYS = [
     key.strip() for key in os.getenv("API_KEYS", "capstone-demo-key").split(",") if key.strip()
 ]
+DEFAULT_API_KEY_SCOPES = ["data:read"]
+ALLOWED_API_KEY_SCOPES = {
+    "data:read",
+    "metrics:read",
+    "alerts:read",
+}
 
 # Login defense settings.
 MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "5"))
@@ -113,6 +120,7 @@ class APIKey(Base):
     name = Column(String, nullable=False)
     key_hash = Column(String, nullable=False, index=True)
     key_prefix = Column(String, nullable=False)
+    scopes = Column(String, nullable=False, default="data:read")
     is_active = Column(Boolean, nullable=False, default=True)
     created_by = Column(String, nullable=False)
     created_at = Column(DateTime, nullable=False, default=utcnow_naive)
@@ -214,7 +222,6 @@ def get_db():
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
-PASSLIB_BCRYPT_USABLE = hasattr(bcrypt_lib, "__about__")
 
 
 def get_request_id() -> Optional[str]:
@@ -279,6 +286,30 @@ def _hash_reset_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _normalize_api_key_scopes(scopes: Optional[list[str]]) -> list[str]:
+    if not scopes:
+        return list(DEFAULT_API_KEY_SCOPES)
+    normalized = sorted({scope.strip() for scope in scopes if scope and scope.strip()})
+    if not normalized:
+        return list(DEFAULT_API_KEY_SCOPES)
+    invalid = [scope for scope in normalized if scope not in ALLOWED_API_KEY_SCOPES]
+    if invalid:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid API key scope(s): {', '.join(invalid)}",
+        )
+    return normalized
+
+
+def _serialize_api_key_scopes(scopes: list[str]) -> str:
+    return ",".join(scopes)
+
+
+def _deserialize_api_key_scopes(scopes_value: str) -> list[str]:
+    scopes = [scope for scope in scopes_value.split(",") if scope]
+    return scopes or list(DEFAULT_API_KEY_SCOPES)
+
+
 def _pad_base32(secret: str) -> str:
     return secret + "=" * ((8 - len(secret) % 8) % 8)
 
@@ -327,19 +358,22 @@ def get_valid_api_key_record(db: Session, raw_key: str) -> Optional[APIKey]:
 
 
 def hash_password(password: str) -> str:
-    if PASSLIB_BCRYPT_USABLE:
+    try:
         return pwd_context.hash(password)
-    hashed = bcrypt_lib.hashpw(password.encode("utf-8"), bcrypt_lib.gensalt())
-    return hashed.decode("utf-8")
+    except Exception:
+        # Fallback keeps auth available if passlib backend init fails unexpectedly.
+        hashed = bcrypt_lib.hashpw(password.encode("utf-8"), bcrypt_lib.gensalt())
+        return hashed.decode("utf-8")
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    if PASSLIB_BCRYPT_USABLE:
-        return pwd_context.verify(password, password_hash)
     try:
-        return bcrypt_lib.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
-    except ValueError:
-        return False
+        return pwd_context.verify(password, password_hash)
+    except Exception:
+        try:
+            return bcrypt_lib.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+        except ValueError:
+            return False
 
 
 def _create_token(
@@ -361,7 +395,7 @@ def _create_token(
     }
     if token_type == "refresh":
         payload["rv"] = refresh_version if refresh_version is not None else 0
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return encode_jwt(payload=payload, secret=SECRET_KEY, algorithm=ALGORITHM)
 
 
 def create_access_token(subject: str) -> str:
@@ -384,11 +418,13 @@ def create_api_key_record(
     *,
     name: str,
     created_by: str,
+    scopes: Optional[list[str]] = None,
     expires_minutes: Optional[int] = None,
     rotated_from_id: Optional[int] = None,
 ) -> tuple[APIKey, str]:
     raw_key = f"cap_{secrets.token_urlsafe(32)}"
     key_hash = _hash_api_key(raw_key)
+    normalized_scopes = _normalize_api_key_scopes(scopes)
     expires_at = (
         utcnow_naive() + timedelta(minutes=expires_minutes)
         if expires_minutes is not None and expires_minutes > 0
@@ -398,6 +434,7 @@ def create_api_key_record(
         name=name,
         key_hash=key_hash,
         key_prefix=raw_key[:12],
+        scopes=_serialize_api_key_scopes(normalized_scopes),
         is_active=True,
         created_by=created_by,
         rotated_from_id=rotated_from_id,
@@ -418,6 +455,7 @@ def seed_api_keys_from_env(db: Session) -> None:
                 name=f"seeded-env-key-{idx}",
                 key_hash=_hash_api_key(raw_key),
                 key_prefix=raw_key[:12],
+                scopes=_serialize_api_key_scopes(DEFAULT_API_KEY_SCOPES),
                 is_active=True,
                 created_by="system",
             )
@@ -582,14 +620,14 @@ def _decode_token(db: Session, token: str, expected_type: str) -> dict:
     )
 
     try:
-        payload = jwt.decode(
-            token,
-            SECRET_KEY,
-            algorithms=[ALGORITHM],
+        payload = decode_jwt(
+            token=token,
+            secret=SECRET_KEY,
+            algorithm=ALGORITHM,
             audience=JWT_AUDIENCE,
             issuer=JWT_ISSUER,
         )
-    except JWTError:
+    except TokenDecodeError:
         raise cred_exc
 
     required = ("sub", "exp", "iat", "jti", "iss", "aud", "typ")
@@ -625,14 +663,29 @@ def get_current_user(db: Session = Depends(get_db), token: str = Depends(oauth2_
     return user
 
 
-def get_current_user_or_api_key(
-    db: Session = Depends(get_db),
-    token: Optional[str] = Depends(oauth2_scheme_optional),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+def _authenticate_user_or_api_key(
+    *,
+    db: Session,
+    token: Optional[str],
+    x_api_key: Optional[str],
+    required_scopes: Optional[set[str]] = None,
 ) -> Optional[User]:
     if x_api_key:
         api_key_record = get_valid_api_key_record(db=db, raw_key=x_api_key)
         if api_key_record:
+            api_key_scopes = set(_deserialize_api_key_scopes(api_key_record.scopes))
+            if required_scopes and not required_scopes.issubset(api_key_scopes):
+                _write_audit_log(
+                    db=db,
+                    action="api_key_auth",
+                    status="failed_insufficient_scope",
+                    details={
+                        "required_scopes": sorted(required_scopes),
+                        "api_key_scopes": sorted(api_key_scopes),
+                    },
+                    commit=True,
+                )
+                raise HTTPException(status_code=403, detail="API key missing required scope")
             api_key_record.last_used_at = utcnow_naive()
             db.commit()
             increment_metric("api_key_auth_successes", 1)
@@ -654,6 +707,31 @@ def get_current_user_or_api_key(
 
     increment_metric("jwt_auth_successes", 1)
     return user
+
+
+def get_current_user_or_api_key(
+    db: Session = Depends(get_db),
+    token: Optional[str] = Depends(oauth2_scheme_optional),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Optional[User]:
+    return _authenticate_user_or_api_key(
+        db=db,
+        token=token,
+        x_api_key=x_api_key,
+    )
+
+
+def get_current_user_or_api_key_for_data(
+    db: Session = Depends(get_db),
+    token: Optional[str] = Depends(oauth2_scheme_optional),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Optional[User]:
+    return _authenticate_user_or_api_key(
+        db=db,
+        token=token,
+        x_api_key=x_api_key,
+        required_scopes={"data:read"},
+    )
 
 
 def require_admin(
@@ -757,6 +835,22 @@ class AuditLogPageOut(BaseModel):
     total: int
 
 
+class SecurityAlertOut(BaseModel):
+    alert_type: str
+    severity: str
+    count: int
+    window_minutes: int
+    first_seen: datetime
+    last_seen: datetime
+    context: dict[str, object]
+
+
+class SecurityAlertsOut(BaseModel):
+    generated_at: datetime
+    window_minutes: int
+    alerts: list[SecurityAlertOut]
+
+
 class AdminActionOut(BaseModel):
     status: str
     username: str
@@ -800,19 +894,20 @@ class MfaSetupOut(BaseModel):
 class APIKeyCreateIn(BaseModel):
     name: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     expires_minutes: Optional[int] = None
+    scopes: Optional[list[str]] = None
 
 
 class APIKeyRotateIn(BaseModel):
     name: Optional[Annotated[str, StringConstraints(min_length=1, max_length=128)]] = None
     expires_minutes: Optional[int] = None
+    scopes: Optional[list[str]] = None
 
 
 class APIKeyOut(BaseModel):
-    model_config = ConfigDict(from_attributes=True)
-
     id: int
     name: str
     key_prefix: str
+    scopes: list[str]
     is_active: bool
     created_by: str
     created_at: datetime
@@ -825,6 +920,21 @@ class APIKeyCreateOut(BaseModel):
     status: str
     api_key: str
     metadata: APIKeyOut
+
+
+def api_key_to_out(record: APIKey) -> APIKeyOut:
+    return APIKeyOut(
+        id=record.id,
+        name=record.name,
+        key_prefix=record.key_prefix,
+        scopes=_deserialize_api_key_scopes(record.scopes),
+        is_active=record.is_active,
+        created_by=record.created_by,
+        created_at=record.created_at,
+        last_used_at=record.last_used_at,
+        rotated_from_id=record.rotated_from_id,
+        expires_at=record.expires_at,
+    )
 
 
 # -------------------------
@@ -951,6 +1061,7 @@ def get_metrics():
         counters = dict(metrics)
     return {
         "uptime_seconds": int((utcnow() - app_start_time).total_seconds()),
+        "jwt_backend": get_jwt_backend_name(),
         "counters": counters,
     }
 
@@ -1296,7 +1407,7 @@ def profile(current_user: User = Depends(get_current_user)):
 
 
 @app.get("/data")
-def data(_auth=Depends(get_current_user_or_api_key)):
+def data(_auth=Depends(get_current_user_or_api_key_for_data)):
     return {"data": "Sensitive data payload"}
 
 
@@ -1394,7 +1505,7 @@ def admin_mfa_disable(
 @app.get("/admin/api-keys", response_model=list[APIKeyOut])
 def admin_list_api_keys(_admin: User = Depends(require_admin), db: Session = Depends(get_db)):
     keys = db.execute(select(APIKey).order_by(APIKey.id.asc())).scalars().all()
-    return keys
+    return [api_key_to_out(key) for key in keys]
 
 
 @app.post("/admin/api-keys", response_model=APIKeyCreateOut)
@@ -1407,6 +1518,7 @@ def admin_create_api_key(
         db=db,
         name=data.name,
         created_by=current_admin.username,
+        scopes=data.scopes,
         expires_minutes=data.expires_minutes,
     )
     _write_audit_log(
@@ -1418,7 +1530,7 @@ def admin_create_api_key(
         details={"key_id": record.id, "name": record.name},
         commit=True,
     )
-    return APIKeyCreateOut(status="ok", api_key=raw_key, metadata=APIKeyOut.model_validate(record))
+    return APIKeyCreateOut(status="ok", api_key=raw_key, metadata=api_key_to_out(record))
 
 
 @app.post("/admin/api-keys/{key_id}/rotate", response_model=APIKeyCreateOut)
@@ -1437,10 +1549,14 @@ def admin_rotate_api_key(
     existing.is_active = False
     db.commit()
     new_name = data.name if data.name else f"{existing.name}-rotated"
+    new_scopes = (
+        data.scopes if data.scopes is not None else _deserialize_api_key_scopes(existing.scopes)
+    )
     record, raw_key = create_api_key_record(
         db=db,
         name=new_name,
         created_by=current_admin.username,
+        scopes=new_scopes,
         expires_minutes=data.expires_minutes,
         rotated_from_id=existing.id,
     )
@@ -1453,7 +1569,7 @@ def admin_rotate_api_key(
         details={"old_key_id": existing.id, "new_key_id": record.id},
         commit=True,
     )
-    return APIKeyCreateOut(status="ok", api_key=raw_key, metadata=APIKeyOut.model_validate(record))
+    return APIKeyCreateOut(status="ok", api_key=raw_key, metadata=api_key_to_out(record))
 
 
 @app.post("/admin/api-keys/{key_id}/revoke")
@@ -1558,6 +1674,88 @@ def admin_auth_failures(
     )
 
 
+def build_security_alerts(
+    db: Session,
+    *,
+    window_minutes: int,
+    min_failed_logins: int,
+    min_admin_denials: int,
+) -> list[SecurityAlertOut]:
+    alerts: list[SecurityAlertOut] = []
+    cutoff = utcnow_naive() - timedelta(minutes=window_minutes)
+
+    login_failure_rows = db.execute(
+        select(
+            AuthFailureLog.username,
+            func.count(AuthFailureLog.id),
+            func.min(AuthFailureLog.created_at),
+            func.max(AuthFailureLog.created_at),
+        )
+        .where(
+            AuthFailureLog.created_at >= cutoff,
+            AuthFailureLog.username.is_not(None),
+            AuthFailureLog.reason.in_(
+                [
+                    "invalid_credentials",
+                    "missing_mfa_code",
+                    "invalid_mfa_code",
+                    "account_locked",
+                ]
+            ),
+        )
+        .group_by(AuthFailureLog.username)
+        .having(func.count(AuthFailureLog.id) >= min_failed_logins)
+    ).all()
+
+    for username, count, first_seen, last_seen in login_failure_rows:
+        severity = "high" if count >= (min_failed_logins * 2) else "medium"
+        alerts.append(
+            SecurityAlertOut(
+                alert_type="login_failure_spike",
+                severity=severity,
+                count=int(count),
+                window_minutes=window_minutes,
+                first_seen=first_seen,
+                last_seen=last_seen,
+                context={"username": username},
+            )
+        )
+
+    admin_denial_rows = db.execute(
+        select(
+            AuditLog.actor_username,
+            func.count(AuditLog.id),
+            func.min(AuditLog.created_at),
+            func.max(AuditLog.created_at),
+        )
+        .where(
+            AuditLog.created_at >= cutoff,
+            AuditLog.action == "admin_access",
+            AuditLog.status == "denied",
+            AuditLog.actor_username.is_not(None),
+        )
+        .group_by(AuditLog.actor_username)
+        .having(func.count(AuditLog.id) >= min_admin_denials)
+    ).all()
+
+    for actor_username, count, first_seen, last_seen in admin_denial_rows:
+        severity = "high" if count >= (min_admin_denials * 2) else "medium"
+        alerts.append(
+            SecurityAlertOut(
+                alert_type="admin_access_denied_spike",
+                severity=severity,
+                count=int(count),
+                window_minutes=window_minutes,
+                first_seen=first_seen,
+                last_seen=last_seen,
+                context={"actor_username": actor_username},
+            )
+        )
+
+    alerts.sort(key=lambda item: item.count, reverse=True)
+    return alerts
+
+
 @app.get("/admin/audit-logs", response_model=AuditLogPageOut)
 def admin_audit_logs(
     page: int = 1,
@@ -1602,6 +1800,44 @@ def admin_audit_logs(
         page=safe_page,
         page_size=safe_page_size,
         total=int(total),
+    )
+
+
+@app.get("/admin/security-alerts", response_model=SecurityAlertsOut)
+def admin_security_alerts(
+    window_minutes: int = 60,
+    min_failed_logins: int = 5,
+    min_admin_denials: int = 3,
+    current_admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    safe_window = max(1, min(window_minutes, 1440))
+    safe_failed_logins = max(1, min_failed_logins)
+    safe_admin_denials = max(1, min_admin_denials)
+    alerts = build_security_alerts(
+        db=db,
+        window_minutes=safe_window,
+        min_failed_logins=safe_failed_logins,
+        min_admin_denials=safe_admin_denials,
+    )
+    _write_audit_log(
+        db=db,
+        action="admin_security_alerts_view",
+        status="success",
+        actor_username=current_admin.username,
+        actor_role=current_admin.role,
+        details={
+            "window_minutes": safe_window,
+            "min_failed_logins": safe_failed_logins,
+            "min_admin_denials": safe_admin_denials,
+            "alerts_returned": len(alerts),
+        },
+        commit=True,
+    )
+    return SecurityAlertsOut(
+        generated_at=utcnow_naive(),
+        window_minutes=safe_window,
+        alerts=alerts,
     )
 
 
