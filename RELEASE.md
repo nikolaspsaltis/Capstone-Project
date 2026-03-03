@@ -17,7 +17,7 @@ Use semantic versioning:
 2. Run local checks:
    ```bash
    ruff check .
-   black --check .
+   black --check --quiet .
    pytest
    ```
 3. Update docs/changelog.
