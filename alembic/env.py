@@ -8,7 +8,7 @@ from alembic import context
 # Ensure app metadata can import even in migration commands.
 os.environ.setdefault("JWT_SECRET", "alembic-migration-secret")
 
-from app.main import Base
+from app.models import Base
 
 config = context.config
 
