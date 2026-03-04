@@ -2,10 +2,17 @@ from app import main as main_app
 
 
 def register(client, username: str, password: str, role: str | None = None):
-    payload = {"username": username, "password": password}
-    if role:
-        payload["role"] = role
-    return client.post("/register", json=payload)
+    response = client.post("/register", json={"username": username, "password": password})
+    if role == "admin" and response.status_code == 201:
+        db = main_app.SessionLocal()
+        try:
+            user = main_app.get_user_by_username(db, username)
+            assert user is not None
+            user.role = "admin"
+            db.commit()
+        finally:
+            db.close()
+    return response
 
 
 def login(client, username: str, password: str):

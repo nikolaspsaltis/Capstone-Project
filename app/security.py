@@ -3,6 +3,7 @@ import logging
 import os
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
+from math import ceil
 from threading import Lock
 from typing import Optional
 
@@ -140,6 +141,16 @@ def _check_login_rate_limit(request: Request, db: Session, username: str) -> str
     )
 
     if attempt_count and attempt_count > RATE_LIMIT_MAX_ATTEMPTS:
+        oldest_attempt = db.scalar(
+            select(func.min(LoginAttempt.created_at)).where(
+                LoginAttempt.ip_address == client_ip,
+                LoginAttempt.created_at >= cutoff,
+            )
+        )
+        elapsed_seconds = (
+            max(0.0, (now - oldest_attempt).total_seconds()) if oldest_attempt else 0.0
+        )
+        retry_after_seconds = max(1, ceil(RATE_LIMIT_WINDOW_SECONDS - elapsed_seconds))
         increment_metric("rate_limit_hits", 1)
         _write_audit_log(
             db=db,
@@ -152,8 +163,9 @@ def _check_login_rate_limit(request: Request, db: Session, username: str) -> str
             commit=True,
         )
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Too many login attempts from this IP. Try again later.",
+            headers={"Retry-After": str(retry_after_seconds)},
         )
 
     return client_ip

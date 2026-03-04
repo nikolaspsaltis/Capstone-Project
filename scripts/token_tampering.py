@@ -1,33 +1,31 @@
 #!/usr/bin/env python3
+import argparse
 import base64
 import json
+import sys
 import time
 from urllib import error, request
 
-BASE_URL = "http://127.0.0.1:8000"
-USERNAME = f"tamper_user_{int(time.time())}"
-PASSWORD = "secret123"
 
-
-def post_json(path: str, payload: dict) -> tuple[int, str]:
+def post_json(base_url: str, path: str, payload: dict, timeout: float) -> tuple[int, str]:
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(
-        f"{BASE_URL}{path}",
+        f"{base_url}{path}",
         data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with request.urlopen(req, timeout=5) as resp:
+        with request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8")
     except error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8")
 
 
-def get(path: str, headers: dict | None = None) -> tuple[int, str]:
-    req = request.Request(f"{BASE_URL}{path}", headers=headers or {}, method="GET")
+def get(base_url: str, path: str, headers: dict | None, timeout: float) -> tuple[int, str]:
+    req = request.Request(f"{base_url}{path}", headers=headers or {}, method="GET")
     try:
-        with request.urlopen(req, timeout=5) as resp:
+        with request.urlopen(req, timeout=timeout) as resp:
             return resp.status, resp.read().decode("utf-8")
     except error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8")
@@ -50,23 +48,85 @@ def tamper_token(token: str) -> str:
     return f"{parts[0]}.{tampered_payload}.{parts[2]}"
 
 
-def main() -> None:
-    post_json("/register", {"username": USERNAME, "password": PASSWORD})
-    login_status, login_body = post_json("/login", {"username": USERNAME, "password": PASSWORD})
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Attempt JWT payload tampering.")
+    parser.add_argument("--base-url", default="http://127.0.0.1:8000")
+    parser.add_argument("--username", default=f"tamper_user_{int(time.time())}")
+    parser.add_argument("--password", default="secret123")
+    parser.add_argument(
+        "--expected-status",
+        type=int,
+        default=401,
+        help="Expected status when calling /profile with a tampered token.",
+    )
+    parser.add_argument("--timeout", type=float, default=5.0)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    try:
+        register_status, register_body = post_json(
+            args.base_url,
+            "/register",
+            {"username": args.username, "password": args.password},
+            args.timeout,
+        )
+    except error.URLError as exc:
+        print(f"[-] Connection failed during register: {exc}")
+        return 2
+
+    if register_status not in (201, 400):
+        print(f"[-] Unexpected register status={register_status}, body={register_body}")
+        return 1
+
+    try:
+        login_status, login_body = post_json(
+            args.base_url,
+            "/login",
+            {"username": args.username, "password": args.password},
+            args.timeout,
+        )
+    except error.URLError as exc:
+        print(f"[-] Connection failed during login: {exc}")
+        return 2
+
     if login_status != 200:
         print(f"[-] Failed to get baseline token. status={login_status}, body={login_body}")
-        return
+        return 1
 
-    token = json.loads(login_body)["access_token"]
-    forged = tamper_token(token)
+    try:
+        token = json.loads(login_body)["access_token"]
+        forged = tamper_token(token)
+    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        print(f"[-] Failed to parse/tamper token: {exc}")
+        return 1
 
-    status, body = get("/profile", headers={"Authorization": f"Bearer {forged}"})
+    try:
+        status, body = get(
+            args.base_url,
+            "/profile",
+            headers={"Authorization": f"Bearer {forged}"},
+            timeout=args.timeout,
+        )
+    except error.URLError as exc:
+        print(f"[-] Connection failed during tampered token request: {exc}")
+        return 2
 
-    if status == 401:
-        print("[+] PASS: Tampered token was rejected (401)")
-    else:
-        print(f"[!] FAIL: Tampered token status={status}, body={body}")
+    print(
+        "[+] Summary: "
+        f"base_url={args.base_url} user={args.username} "
+        f"expected={args.expected_status} observed={status}"
+    )
+
+    if status == args.expected_status:
+        print("[+] PASS: Tampered token rejected as expected")
+        return 0
+
+    print(f"[-] FAIL: Unexpected status for tampered token. status={status}, body={body}")
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

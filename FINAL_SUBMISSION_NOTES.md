@@ -2,23 +2,27 @@
 
 ## Snapshot
 - Branch: `main`
-- Target release tag: `v0.4.0`
+- Target release tag: `v0.6.0`
 - Scope includes audit logging, admin audit endpoint, enriched metrics, migrations, tests, and report artifacts.
 
 ## Reproducibility
-1. `set -a; . ./.env; set +a`
-2. `secure-api-capstone/.venv/bin/alembic upgrade head`
-3. `secure-api-capstone/.venv/bin/python -m pytest -q`
-4. `secure-api-capstone/.venv/bin/python -m ruff check .`
-5. `secure-api-capstone/.venv/bin/python -m black --check --quiet .`
+1. `python -m venv .venv`
+2. `source .venv/bin/activate`
+3. `pip install -r requirements.txt`
+4. `set -a; . ./.env; set +a`
+5. `alembic upgrade head`
+6. `pytest -q`
+7. `ruff check .`
+8. `black --check --quiet .`
 
 ## Evidence Artifacts (results/)
-- `evaluation_report_20260302_182627.md`
-- `evaluation_summary_20260302_182627.json`
-- `performance_20260302_182451.csv`
-- `graph_report_combined_2x2_20260302_182627.png`
-- Supporting logs and component graphs from the same run timestamp set.
+- `evaluation_report_20260304_154048.md`
+- `evaluation_summary_20260304_154048.json`
+- `performance_20260304_154048.csv` (from full evaluation runner)
+- `graph_evaluation_diagnostics_20260304_154048.png`
+- `graph_report_combined_2x2_20260302_182627.png` (archived report figure)
 
 ## Notes
 - Root path `/` intentionally returns `404` (no root endpoint defined).
-- `passlib` has been removed from runtime; remaining JWT deprecation warnings are from the `python-jose` path while `JWT_BACKEND=python-jose` is active.
+- Password hashing runtime uses `passlib` + `bcrypt` (`passlib==1.7.4`, `bcrypt==4.0.1`) with a direct `bcrypt` fallback path in code.
+- `JWT_BACKEND=python-jose` is the active default backend unless changed.
