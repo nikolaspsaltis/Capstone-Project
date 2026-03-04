@@ -235,10 +235,20 @@ How generated:
 - `requirements.txt` is the authoritative dependency list.
 - API root `/` intentionally returns `404` (use `/docs` and `/health`).
 
-## Create Submission Zip
+## Submission Packaging
 Create a submission archive while excluding unsafe/non-portable files:
 
 ```bash
-zip -r capstone-submission.zip . \
-  -x ".git/*" ".venv/*" "secure-api-capstone/.venv/*" "*/__pycache__/*" "*.pyc" ".env" "app.db" "test_app.db"
+bash scripts/make_submission_zip.sh
+```
+
+Manual equivalent:
+
+```bash
+zip -r submission.zip . \
+  -x ".git/*" ".venv/*" "*/.venv/*" "secure-api-capstone/.venv/*" \
+  -x "__pycache__/*" "*/__pycache__/*" "*.pyc" \
+  -x ".pytest_cache/*" ".ruff_cache/*" ".coverage" \
+  -x ".env" "app.db" "test_app.db" \
+  -x "results/*.csv" "results/*.log"
 ```

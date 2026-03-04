@@ -1,5 +1,6 @@
 # Virtual environments
 .venv/
+*/.venv/
 secure-api-capstone/.venv/
 
 # Python build/runtime artifacts
@@ -14,6 +15,7 @@ test_app.db
 # Generated result artifacts not intended for version control
 results/*.csv
 results/*.log
+submission.zip
 
 # Tool caches
 .pytest_cache/
