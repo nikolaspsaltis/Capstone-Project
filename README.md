@@ -55,6 +55,29 @@ From repo root:
 cd "/home/nikolas/Documents/UoE Documents/Captone-Project"
 ```
 
+### Fresh setup
+For a clean machine/environment, run:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+# edit .env and set required values (at minimum: JWT_SECRET, API_KEYS, DATABASE_URL)
+alembic upgrade head
+uvicorn app.main:app --reload
+```
+
+With server running, execute security/performance scripts and regenerate results:
+
+```bash
+python scripts/bruteforce_login.py
+python scripts/token_tampering.py
+python scripts/unauthorized_admin_access.py
+python scripts/performance_test.py
+python scripts/run_capstone_evaluation.py
+```
+
 Create and activate virtual environment:
 
 ```bash
@@ -211,3 +234,11 @@ How generated:
 - No secrets are committed; `.env` is local-only.
 - `requirements.txt` is the authoritative dependency list.
 - API root `/` intentionally returns `404` (use `/docs` and `/health`).
+
+## Create Submission Zip
+Create a submission archive while excluding unsafe/non-portable files:
+
+```bash
+zip -r capstone-submission.zip . \
+  -x ".git/*" ".venv/*" "secure-api-capstone/.venv/*" "*/__pycache__/*" "*.pyc" ".env" "app.db" "test_app.db"
+```
