@@ -1,9 +1,11 @@
 .venv/
+secure-api-capstone/.venv/
 __pycache__/
 *.pyc
 app.db
 .env
 results/*.csv
+results/*.log
 .pytest_cache/
 .ruff_cache/
 .coverage
