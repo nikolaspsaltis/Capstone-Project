@@ -1,12 +1,21 @@
+# Virtual environments
 .venv/
 secure-api-capstone/.venv/
+
+# Python build/runtime artifacts
 __pycache__/
 *.pyc
-app.db
+
+# Local secrets and local databases
 .env
+app.db
+test_app.db
+
+# Generated result artifacts not intended for version control
 results/*.csv
 results/*.log
+
+# Tool caches
 .pytest_cache/
 .ruff_cache/
 .coverage
-test_app.db
