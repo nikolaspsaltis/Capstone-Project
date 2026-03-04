@@ -4,8 +4,9 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import close_all_sessions, sessionmaker
 
-TEST_DB_PATH = Path("./test_app.db")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -26,28 +27,49 @@ os.environ["RATE_LIMIT_MAX_ATTEMPTS"] = "3"
 os.environ["AUTH_FAILURE_LOG_RETENTION_DAYS"] = "30"
 os.environ["LOGIN_ATTEMPT_RETENTION_DAYS"] = "7"
 os.environ["CLEANUP_INTERVAL_MINUTES"] = "60"
+os.environ["TESTING"] = "1"
+os.environ["BCRYPT_TEST_ROUNDS"] = "4"
 
+from app import database as database_module
 from app import main as main_app
+from app import security as security_module
 
 
 @pytest.fixture(autouse=True)
-def clean_db():
-    main_app.Base.metadata.drop_all(bind=main_app.engine)
-    main_app.Base.metadata.create_all(bind=main_app.engine)
+def isolated_db(tmp_path):
+    db_path = tmp_path / "test_app.db"
+    db_url = f"sqlite:///{db_path}"
+    test_engine = create_engine(db_url, connect_args={"check_same_thread": False})
+    test_session_local = sessionmaker(bind=test_engine, autoflush=False, autocommit=False)
+
+    old_main_engine = main_app.engine
+    old_main_session_local = main_app.SessionLocal
+    old_db_engine = database_module.engine
+    old_db_session_local = database_module.SessionLocal
+
+    main_app.engine = test_engine
+    main_app.SessionLocal = test_session_local
+    database_module.engine = test_engine
+    database_module.SessionLocal = test_session_local
+
+    main_app.Base.metadata.create_all(bind=test_engine)
+    security_module.last_cleanup_run = None
     with main_app.metrics_lock:
         for key in main_app.metrics:
             main_app.metrics[key] = 0
-    yield
+
+    try:
+        yield
+    finally:
+        close_all_sessions()
+        test_engine.dispose()
+        main_app.engine = old_main_engine
+        main_app.SessionLocal = old_main_session_local
+        database_module.engine = old_db_engine
+        database_module.SessionLocal = old_db_session_local
 
 
 @pytest.fixture
 def client():
     with TestClient(main_app.app) as test_client:
         yield test_client
-
-
-@pytest.fixture(scope="session", autouse=True)
-def cleanup_db_file():
-    yield
-    if TEST_DB_PATH.exists():
-        TEST_DB_PATH.unlink()

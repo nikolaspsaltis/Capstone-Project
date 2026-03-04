@@ -95,7 +95,9 @@ def make_plot(ts: str, records: list[dict], output_path: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate evaluation diagnostic graph from summary JSON")
+    parser = argparse.ArgumentParser(
+        description="Generate evaluation diagnostic graph from summary JSON"
+    )
     parser.add_argument(
         "--summary",
         default="results/evaluation_summary_20260302_182627.json",

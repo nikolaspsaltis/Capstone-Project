@@ -1,0 +1,8 @@
+attempt_index,password_type,status_code
+1,wrong,401
+2,wrong,401
+3,wrong,401
+4,wrong,401
+5,wrong,401
+6,wrong,403
+7,correct,403

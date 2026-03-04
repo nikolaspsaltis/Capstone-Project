@@ -1,4 +1,5 @@
 import logging
+import os
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -8,6 +9,7 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, ConfigDict, StringConstraints
@@ -193,7 +195,6 @@ def require_admin(
 class RegisterIn(BaseModel):
     username: Annotated[str, StringConstraints(min_length=3, max_length=64)]
     password: Annotated[str, StringConstraints(min_length=6, max_length=256)]
-    role: Optional[str] = None
 
 
 class LoginIn(BaseModel):
@@ -371,6 +372,21 @@ def api_key_to_out(record: APIKey) -> APIKeyOut:
 # -------------------------
 # App
 # -------------------------
+def _load_allowed_origins() -> list[str]:
+    raw = os.getenv("ALLOWED_ORIGINS", "")
+    if not raw.strip():
+        return []
+
+    origins: list[str] = []
+    seen: set[str] = set()
+    for part in raw.split(","):
+        origin = part.strip().rstrip("/")
+        if origin and origin not in seen:
+            origins.append(origin)
+            seen.add(origin)
+    return origins
+
+
 def startup_checks() -> None:
     _validate_required_schema()
     db = SessionLocal()
@@ -387,6 +403,16 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Secure API Capstone Starter", lifespan=lifespan)
+allowed_origins = _load_allowed_origins()
+if allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
+        expose_headers=["X-Request-ID", "Retry-After"],
+        allow_credentials=False,
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -518,12 +544,10 @@ def register(data: RegisterIn, request: Request, db: Session = Depends(get_db)):
         )
         raise HTTPException(status_code=400, detail="Username already exists")
 
-    role = data.role if data.role in {"user", "admin"} else "user"
-
     user = User(
         username=data.username,
         password_hash=hash_password(data.password),
-        role=role,
+        role="user",
     )
     db.add(user)
     db.commit()

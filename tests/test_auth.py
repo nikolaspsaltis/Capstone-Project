@@ -1,14 +1,25 @@
 import base64
 import json
 
+import pytest
+
+from app import auth as auth_app
 from app import main as main_app
+from app import security as security_app
 
 
 def register(client, username: str, password: str, role: str | None = None):
-    payload = {"username": username, "password": password}
-    if role:
-        payload["role"] = role
-    return client.post("/register", json=payload)
+    response = client.post("/register", json={"username": username, "password": password})
+    if role == "admin" and response.status_code == 201:
+        db = main_app.SessionLocal()
+        try:
+            user = main_app.get_user_by_username(db, username)
+            assert user is not None
+            user.role = "admin"
+            db.commit()
+        finally:
+            db.close()
+    return response
 
 
 def login(client, username: str, password: str):
@@ -24,6 +35,19 @@ def test_register_validation_duplicate_and_password_length(client):
 
     long_pw = register(client, "bob", "a" * 73)
     assert long_pw.status_code == 400
+
+
+def test_register_ignores_admin_role_input(client):
+    created = client.post(
+        "/register",
+        json={"username": "eve", "password": "secret123", "role": "admin"},
+    )
+    assert created.status_code == 201
+    assert created.json()["role"] == "user"
+
+    token = login(client, "eve", "secret123").json()["access_token"]
+    denied = client.get("/admin/users", headers={"Authorization": f"Bearer {token}"})
+    assert denied.status_code == 403
 
 
 def test_login_profile_and_invalid_creds(client):
@@ -97,26 +121,27 @@ def test_refresh_rotation_and_logout_revocation(client):
 def test_account_lockout(client):
     register(client, "alice", "secret123")
 
-    original_limit = main_app.RATE_LIMIT_MAX_ATTEMPTS
-    main_app.RATE_LIMIT_MAX_ATTEMPTS = 100
+    original_limit = security_app.RATE_LIMIT_MAX_ATTEMPTS
+    security_app.RATE_LIMIT_MAX_ATTEMPTS = 100
     try:
-        for _ in range(main_app.MAX_LOGIN_ATTEMPTS):
+        for _ in range(security_app.MAX_LOGIN_ATTEMPTS):
             failed = login(client, "alice", "wrongpass")
             assert failed.status_code == 401
 
         locked = login(client, "alice", "secret123")
         assert locked.status_code == 403
     finally:
-        main_app.RATE_LIMIT_MAX_ATTEMPTS = original_limit
+        security_app.RATE_LIMIT_MAX_ATTEMPTS = original_limit
 
 
 def test_rate_limit(client):
-    for _ in range(main_app.RATE_LIMIT_MAX_ATTEMPTS):
+    for _ in range(security_app.RATE_LIMIT_MAX_ATTEMPTS):
         failed = login(client, "ghost", "whatever")
         assert failed.status_code == 401
 
     blocked = login(client, "ghost", "whatever")
-    assert blocked.status_code == 403
+    assert blocked.status_code == 429
+    assert "Retry-After" in blocked.headers
 
 
 def test_tampered_jwt_is_rejected(client):
@@ -136,3 +161,15 @@ def test_tampered_jwt_is_rejected(client):
     tampered = f"{header_b64}.{tampered_payload_b64}.{signature}"
     response = client.get("/profile", headers={"Authorization": f"Bearer {tampered}"})
     assert response.status_code == 401
+
+
+def test_api_keys_loader_requires_explicit_value(monkeypatch):
+    monkeypatch.delenv("API_KEYS", raising=False)
+    with pytest.raises(auth_app.StartupConfigurationError, match="API_KEYS is missing or empty"):
+        auth_app._load_api_keys()
+
+
+def test_api_keys_loader_rejects_placeholder(monkeypatch):
+    monkeypatch.setenv("API_KEYS", "change-this-api-key-in-production")
+    with pytest.raises(auth_app.StartupConfigurationError, match="placeholder/demo"):
+        auth_app._load_api_keys()

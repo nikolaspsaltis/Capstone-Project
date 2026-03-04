@@ -1,13 +1,22 @@
 from datetime import timedelta
 
 from app import main as main_app
+from app import security as security_app
+from app.models import AuthFailureLog, LoginAttempt, RevokedToken
 
 
 def register(client, username: str, password: str, role: str | None = None):
-    payload = {"username": username, "password": password}
-    if role:
-        payload["role"] = role
-    return client.post("/register", json=payload)
+    response = client.post("/register", json={"username": username, "password": password})
+    if role == "admin" and response.status_code == 201:
+        db = main_app.SessionLocal()
+        try:
+            user = main_app.get_user_by_username(db, username)
+            assert user is not None
+            user.role = "admin"
+            db.commit()
+        finally:
+            db.close()
+    return response
 
 
 def login(client, username: str, password: str):
@@ -20,10 +29,10 @@ def test_admin_can_unlock_user(client):
 
     admin_access = login(client, "admin", "adminpass").json()["access_token"]
 
-    original_limit = main_app.RATE_LIMIT_MAX_ATTEMPTS
-    main_app.RATE_LIMIT_MAX_ATTEMPTS = 100
+    original_limit = security_app.RATE_LIMIT_MAX_ATTEMPTS
+    security_app.RATE_LIMIT_MAX_ATTEMPTS = 100
     try:
-        for _ in range(main_app.MAX_LOGIN_ATTEMPTS):
+        for _ in range(security_app.MAX_LOGIN_ATTEMPTS):
             bad = login(client, "lockeduser", "wrongpass")
             assert bad.status_code == 401
 
@@ -39,7 +48,7 @@ def test_admin_can_unlock_user(client):
         after = login(client, "lockeduser", "secret123")
         assert after.status_code == 200
     finally:
-        main_app.RATE_LIMIT_MAX_ATTEMPTS = original_limit
+        security_app.RATE_LIMIT_MAX_ATTEMPTS = original_limit
 
 
 def test_non_admin_cannot_unlock_user(client):
@@ -57,14 +66,14 @@ def test_admin_can_view_auth_failure_logs(client):
     register(client, "admin", "adminpass", role="admin")
     admin_access = login(client, "admin", "adminpass").json()["access_token"]
 
-    original_limit = main_app.RATE_LIMIT_MAX_ATTEMPTS
-    main_app.RATE_LIMIT_MAX_ATTEMPTS = 100
+    original_limit = security_app.RATE_LIMIT_MAX_ATTEMPTS
+    security_app.RATE_LIMIT_MAX_ATTEMPTS = 100
     try:
         login(client, "ghost", "wrong1")
         login(client, "ghost", "wrong2")
         login(client, "other", "wrong3")
     finally:
-        main_app.RATE_LIMIT_MAX_ATTEMPTS = original_limit
+        security_app.RATE_LIMIT_MAX_ATTEMPTS = original_limit
 
     page_1 = client.get(
         "/admin/auth-failures?page=1&page_size=1&username=ghost",
@@ -134,29 +143,29 @@ def test_admin_cleanup_removes_expired_and_old_records(client):
     try:
         now = main_app.utcnow_naive()
         db.add(
-            main_app.RevokedToken(
+            RevokedToken(
                 jti="expired-jti",
                 token_type="refresh",
                 expires_at=now - timedelta(days=1),
             )
         )
         db.add(
-            main_app.RevokedToken(
+            RevokedToken(
                 jti="active-jti",
                 token_type="refresh",
                 expires_at=now + timedelta(days=1),
             )
         )
         db.add(
-            main_app.AuthFailureLog(
+            AuthFailureLog(
                 username="old-user",
                 ip_address="127.0.0.1",
                 reason="invalid_credentials",
-                created_at=now - timedelta(days=main_app.AUTH_FAILURE_LOG_RETENTION_DAYS + 1),
+                created_at=now - timedelta(days=security_app.AUTH_FAILURE_LOG_RETENTION_DAYS + 1),
             )
         )
         db.add(
-            main_app.AuthFailureLog(
+            AuthFailureLog(
                 username="fresh-user",
                 ip_address="127.0.0.1",
                 reason="invalid_credentials",
@@ -164,12 +173,12 @@ def test_admin_cleanup_removes_expired_and_old_records(client):
             )
         )
         db.add(
-            main_app.LoginAttempt(
+            LoginAttempt(
                 ip_address="127.0.0.1",
-                created_at=now - timedelta(days=main_app.LOGIN_ATTEMPT_RETENTION_DAYS + 1),
+                created_at=now - timedelta(days=security_app.LOGIN_ATTEMPT_RETENTION_DAYS + 1),
             )
         )
-        db.add(main_app.LoginAttempt(ip_address="127.0.0.1", created_at=now))
+        db.add(LoginAttempt(ip_address="127.0.0.1", created_at=now))
         db.commit()
     finally:
         db.close()

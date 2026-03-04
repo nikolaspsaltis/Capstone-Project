@@ -19,7 +19,56 @@ from app.database import utcnow, utcnow_naive
 from app.jwt_backend import TokenDecodeError, decode_jwt, encode_jwt
 from app.models import APIKey, User
 
-SECRET_KEY = os.getenv("JWT_SECRET", "")
+
+class StartupConfigurationError(RuntimeError):
+    """Intentional fail-fast for missing/unsafe runtime configuration."""
+
+
+def _load_jwt_secret() -> str:
+    secret = os.getenv("JWT_SECRET", "")
+    if not secret:
+        raise StartupConfigurationError(
+            "Intentional startup block: required env var JWT_SECRET is missing.\n"
+            "How to fix:\n"
+            "1) Copy .env.example to .env\n"
+            "2) Set JWT_SECRET to a strong random value in .env\n"
+            "3) Load env vars: set -a; . ./.env; set +a\n"
+            "Reference: .env.example"
+        )
+    if secret == "change-this-secret-in-production":
+        raise StartupConfigurationError(
+            "Intentional startup block: JWT_SECRET is still set to the placeholder value.\n"
+            "Update JWT_SECRET in .env (see .env.example), then reload env vars."
+        )
+    return secret
+
+
+def _load_api_keys() -> list[str]:
+    raw_value = os.getenv("API_KEYS", "")
+    keys = [key.strip() for key in raw_value.split(",") if key.strip()]
+    if not keys:
+        raise StartupConfigurationError(
+            "Intentional startup block: required env var API_KEYS is missing or empty.\n"
+            "How to fix:\n"
+            "1) Copy .env.example to .env\n"
+            "2) Set API_KEYS to one or more strong values (comma-separated)\n"
+            "3) Load env vars: set -a; . ./.env; set +a\n"
+            "Reference: .env.example"
+        )
+
+    placeholder_values = {
+        "capstone-demo-key",
+        "change-this-api-key-in-production",
+    }
+    if any(key in placeholder_values for key in keys):
+        raise StartupConfigurationError(
+            "Intentional startup block: API_KEYS is still set to a placeholder/demo value.\n"
+            "Set API_KEYS in .env to strong random values before starting the app."
+        )
+    return keys
+
+
+SECRET_KEY = _load_jwt_secret()
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 JWT_ISSUER = os.getenv("JWT_ISSUER", "capstone-project")
 JWT_AUDIENCE = os.getenv("JWT_AUDIENCE", "capstone-client")
@@ -27,15 +76,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "30"))
 REFRESH_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_REFRESH_EXPIRE_MINUTES", "10080"))
 PASSWORD_RESET_TOKEN_EXPIRE_MINUTES = int(os.getenv("PASSWORD_RESET_TOKEN_EXPIRE_MINUTES", "15"))
 
-if not SECRET_KEY or SECRET_KEY == "change-this-secret-in-production":
-    raise RuntimeError(
-        "JWT_SECRET must be set to a strong value (and not the placeholder) before running the app."
-    )
-
 # API key rotation is supported by comma-separated keys in API_KEYS.
-API_KEYS = [
-    key.strip() for key in os.getenv("API_KEYS", "capstone-demo-key").split(",") if key.strip()
-]
+API_KEYS = _load_api_keys()
 DEFAULT_API_KEY_SCOPES = ["data:read"]
 ALLOWED_API_KEY_SCOPES = {
     "data:read",
@@ -43,7 +85,24 @@ ALLOWED_API_KEY_SCOPES = {
     "alerts:read",
 }
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def _is_truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+TESTING_MODE = _is_truthy(os.getenv("TESTING", "0"))
+DEFAULT_BCRYPT_ROUNDS = 12
+TEST_BCRYPT_ROUNDS = 4
+bcrypt_rounds = int(os.getenv("BCRYPT_ROUNDS", str(DEFAULT_BCRYPT_ROUNDS)))
+if TESTING_MODE:
+    bcrypt_rounds = int(os.getenv("BCRYPT_TEST_ROUNDS", str(TEST_BCRYPT_ROUNDS)))
+bcrypt_rounds = max(4, bcrypt_rounds)
+
+pwd_context = CryptContext(
+    schemes=["bcrypt"],
+    deprecated="auto",
+    bcrypt__rounds=bcrypt_rounds,
+)
 
 
 def _hash_api_key(api_key: str) -> str:
@@ -130,7 +189,10 @@ def hash_password(password: str) -> str:
         return pwd_context.hash(password)
     except Exception:
         # Fallback keeps auth available if passlib backend init fails unexpectedly.
-        hashed = bcrypt_lib.hashpw(password.encode("utf-8"), bcrypt_lib.gensalt())
+        hashed = bcrypt_lib.hashpw(
+            password.encode("utf-8"),
+            bcrypt_lib.gensalt(rounds=bcrypt_rounds),
+        )
         return hashed.decode("utf-8")
 
 
