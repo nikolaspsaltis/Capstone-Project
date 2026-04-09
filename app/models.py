@@ -78,6 +78,8 @@ class AuditLog(Base):
     ip_address = Column(String, nullable=False, index=True)
     details = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=utcnow_naive, index=True)
+    prev_hash = Column(String(64), nullable=True)
+    record_hash = Column(String(64), nullable=False, default=lambda: "0" * 64)
 
 
 class RevokedToken(Base):
@@ -89,3 +91,14 @@ class RevokedToken(Base):
     token_type = Column(String, nullable=False)
     revoked_at = Column(DateTime, nullable=False, default=utcnow_naive)
     expires_at = Column(DateTime, nullable=False)
+
+
+class ServiceRegistry(Base):
+    __tablename__ = "service_registry"
+
+    id = Column(Integer, primary_key=True)
+    service_id = Column(String(64), unique=True, nullable=False)
+    audience = Column(String(256), unique=True, nullable=False)
+    allowed_callers = Column(Text, nullable=False)
+    enabled = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=utcnow_naive)

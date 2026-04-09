@@ -37,7 +37,8 @@ def test_admin_can_unlock_user(client):
             assert bad.status_code == 401
 
         locked = login(client, "lockeduser", "secret123")
-        assert locked.status_code == 403
+        assert locked.status_code == 429
+        assert "Retry-After" in locked.headers
 
         unlock = client.post(
             "/admin/users/lockeduser/unlock",

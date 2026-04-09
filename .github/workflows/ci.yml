@@ -117,3 +117,22 @@ jobs:
           python scripts/performance_test.py | tee /tmp/perf.out
           grep -q "CSV written to:" /tmp/perf.out
           ls results/performance_*.csv >/dev/null
+
+      - name: Zero-trust attack demo
+        env:
+          JWT_SECRET: ci-secret-not-for-production
+          JWT_ISSUER: capstone-project
+          JWT_AUDIENCE: capstone-client
+          DATABASE_URL: sqlite:///./ci_zt.db
+          API_KEYS: capstone-demo-key
+          WORKLOAD_ATTESTATION_SECRET: ci-attestation-secret
+          APP_ENV: prod
+        run: |
+          alembic upgrade head
+
+          uvicorn app.main:app --host 127.0.0.1 --port 8001 &
+          APP_PID=$!
+          trap "kill $APP_PID" EXIT
+          sleep 3
+
+          python scripts/run_capstone_evaluation.py --base-url http://127.0.0.1:8001

@@ -1,0 +1,23 @@
+# policies/default.yaml
+# Rules are evaluated top-to-bottom. First matching deny_if wins.
+# Hot-reload: send SIGHUP to the server process.
+
+rules:
+  - id: block_user_admin_endpoints
+    deny_if:
+      role: user
+      path_prefix: /admin
+    reason: "admin role required for /admin endpoints"
+
+  - id: block_maintenance_window
+    deny_if:
+      method: POST
+      path_prefix: /admin/maintenance
+      utc_hour_range: [2, 4]    # 02:00-04:00 UTC
+    reason: "maintenance writes blocked 02:00-04:00 UTC"
+
+  - id: block_dev_targeting_prod
+    deny_if:
+      token_env: dev
+      target_audience_prefix: "https://prod."
+    reason: "dev tokens cannot target prod audience"

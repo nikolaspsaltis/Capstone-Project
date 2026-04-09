@@ -11,6 +11,8 @@ __pycache__/
 .env
 app.db
 test_app.db
+jwt_signing.pem
+*.pem
 
 # Generated result artifacts not intended for version control
 results/*.csv

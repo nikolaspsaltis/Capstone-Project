@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import secrets
@@ -16,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, StringConstraints
 from sqlalchemy import func, inspect, select
 from sqlalchemy.orm import Session
 
+from app import jwks as jwks_module
 from app.auth import (
     JWT_ISSUER,
     PASSWORD_RESET_TOKEN_EXPIRE_MINUTES,
@@ -34,18 +36,23 @@ from app.auth import (
     verify_password,
     verify_totp_code,
 )
+from app.broker import ServiceRegistryCreate
+from app.broker import router as broker_router
 from app.database import Base as _Base
 from app.database import SessionLocal, engine, get_db, utcnow, utcnow_naive
-from app.jwt_backend import get_jwt_backend_name
+from app.jwt_backend import get_jwt_backend_name, load_or_generate_signing_key
 from app.models import (
     APIKey,
     AuditLog,
     AuthFailureLog,
     PasswordResetToken,
+    ServiceRegistry,
     User,
 )
+from app.policy import PolicyContext, evaluate
 from app.security import (
     _check_login_rate_limit,
+    _compute_record_hash,
     _is_token_revoked,
     _is_user_locked,
     _register_auth_failure,
@@ -61,6 +68,7 @@ from app.security import (
     request_id_ctx,
     run_cleanup_jobs,
 )
+from app.workload_identity import router as workload_router
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
@@ -172,7 +180,13 @@ def require_admin(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ) -> User:
-    if current_user.role != "admin":
+    ctx = PolicyContext(
+        role=current_user.role,
+        method=request.method,
+        path=request.url.path,
+    )
+    decision = evaluate(ctx)
+    if not decision.allowed:
         increment_metric("admin_access_denied", 1)
         _write_audit_log(
             db=db,
@@ -181,10 +195,17 @@ def require_admin(
             request=request,
             actor_username=current_user.username,
             actor_role=current_user.role,
-            details={"path": request.url.path},
+            details={"path": request.url.path, "rule_id": decision.rule_id},
             commit=True,
         )
-        raise HTTPException(status_code=403, detail="Forbidden")
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "policy_denied",
+                "reason": decision.reason,
+                "rule_id": decision.rule_id,
+            },
+        )
     increment_metric("admin_access_granted", 1)
     return current_user
 
@@ -373,10 +394,7 @@ def api_key_to_out(record: APIKey) -> APIKeyOut:
 # App
 # -------------------------
 def _load_allowed_origins() -> list[str]:
-    raw = os.getenv("ALLOWED_ORIGINS", "")
-    if not raw.strip():
-        return []
-
+    raw = os.getenv("ALLOWED_ORIGINS", "http://localhost:3000")
     origins: list[str] = []
     seen: set[str] = set()
     for part in raw.split(","):
@@ -388,6 +406,7 @@ def _load_allowed_origins() -> list[str]:
 
 
 def startup_checks() -> None:
+    load_or_generate_signing_key()
     _validate_required_schema()
     db = SessionLocal()
     try:
@@ -403,16 +422,17 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Secure API Capstone Starter", lifespan=lifespan)
-allowed_origins = _load_allowed_origins()
-if allowed_origins:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allowed_origins,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
-        expose_headers=["X-Request-ID", "Retry-After"],
-        allow_credentials=False,
-    )
+app.include_router(jwks_module.router)
+app.include_router(broker_router)
+app.include_router(workload_router)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_load_allowed_origins(),
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Request-ID"],
+    expose_headers=["X-Request-ID", "Retry-After"],
+    allow_credentials=False,
+)
 
 
 @app.exception_handler(RequestValidationError)
@@ -589,7 +609,12 @@ def login(data: LoginIn, request: Request, db: Session = Depends(get_db)):
             target_username=data.username,
             commit=True,
         )
-        raise HTTPException(status_code=403, detail="Account locked. Try again later.")
+        remaining_seconds = max(1, int((user.locked_until - utcnow_naive()).total_seconds()))
+        raise HTTPException(
+            status_code=429,
+            headers={"Retry-After": str(remaining_seconds)},
+            detail="Account locked. Try again later.",
+        )
 
     if not user or not verify_password(data.password, user.password_hash):
         _register_auth_failure(
@@ -1256,6 +1281,85 @@ def admin_audit_logs(
         page_size=safe_page_size,
         total=int(total),
     )
+
+
+@app.get("/admin/audit-logs/verify", dependencies=[Depends(require_admin)])
+def verify_audit_chain(db: Session = Depends(get_db)):
+    prev_hash = "0" * 64
+    count = 0
+    rows = db.execute(select(AuditLog).order_by(AuditLog.id)).scalars()
+    for row in rows:
+        # Both the stored prev_hash and the recomputed record_hash must match.
+        stored_prev = row.prev_hash or "0" * 64
+        if stored_prev != prev_hash:
+            return {
+                "ok": False,
+                "records": count,
+                "chain_valid": False,
+                "first_broken_id": row.id,
+            }
+        ts_str = (
+            row.created_at.isoformat()
+            if isinstance(row.created_at, datetime)
+            else str(row.created_at)
+        )
+        expected = _compute_record_hash(
+            prev_hash,
+            ts_str,
+            row.action,
+            row.actor_username or "",
+            row.target_username or "",
+            row.status,
+        )
+        if expected != row.record_hash:
+            return {
+                "ok": False,
+                "records": count,
+                "chain_valid": False,
+                "first_broken_id": row.id,
+            }
+        prev_hash = row.record_hash
+        count += 1
+    return {"ok": True, "records": count, "chain_valid": True}
+
+
+@app.post("/admin/service-registry", dependencies=[Depends(require_admin)])
+def create_service_entry(
+    body: ServiceRegistryCreate,
+    db: Session = Depends(get_db),
+):
+    if db.query(ServiceRegistry).filter_by(audience=body.audience).first():
+        raise HTTPException(409, detail="audience_already_registered")
+    entry = ServiceRegistry(
+        service_id=body.service_id,
+        audience=body.audience,
+        allowed_callers=json.dumps(body.allowed_callers),
+    )
+    db.add(entry)
+    db.commit()
+    return {"id": entry.id, "service_id": entry.service_id}
+
+
+@app.get("/admin/service-registry", dependencies=[Depends(require_admin)])
+def list_service_entries(db: Session = Depends(get_db)):
+    rows = db.query(ServiceRegistry).all()
+    return [
+        {
+            "id": r.id,
+            "service_id": r.service_id,
+            "audience": r.audience,
+            "allowed_callers": json.loads(r.allowed_callers),
+            "enabled": r.enabled,
+        }
+        for r in rows
+    ]
+
+
+@app.get("/admin/policy/rules", dependencies=[Depends(require_admin)])
+def get_policy_rules():
+    from app.policy import _rules
+
+    return {"count": len(_rules), "rules": _rules}
 
 
 @app.get("/admin/security-alerts", response_model=SecurityAlertsOut)

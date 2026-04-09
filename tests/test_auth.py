@@ -129,7 +129,8 @@ def test_account_lockout(client):
             assert failed.status_code == 401
 
         locked = login(client, "alice", "secret123")
-        assert locked.status_code == 403
+        assert locked.status_code == 429
+        assert "Retry-After" in locked.headers
     finally:
         security_app.RATE_LIMIT_MAX_ATTEMPTS = original_limit
 
@@ -173,3 +174,16 @@ def test_api_keys_loader_rejects_placeholder(monkeypatch):
     monkeypatch.setenv("API_KEYS", "change-this-api-key-in-production")
     with pytest.raises(auth_app.StartupConfigurationError, match="placeholder/demo"):
         auth_app._load_api_keys()
+
+
+def test_register_cannot_self_assign_admin_role(client):
+    r = client.post(
+        "/register",
+        json={"username": "badactor", "password": "Str0ng!pw99", "role": "admin"},
+    )
+    assert r.status_code == 201
+    token = client.post("/login", json={"username": "badactor", "password": "Str0ng!pw99"}).json()[
+        "access_token"
+    ]
+    profile = client.get("/profile", headers={"Authorization": f"Bearer {token}"})
+    assert profile.json()["role"] == "user"

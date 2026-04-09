@@ -10,14 +10,26 @@ from typing import Callable, Optional
 from uuid import uuid4
 
 import bcrypt as bcrypt_lib
-from fastapi import HTTPException, status
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
 from passlib.context import CryptContext
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.database import utcnow, utcnow_naive
-from app.jwt_backend import TokenDecodeError, decode_jwt, encode_jwt
+from app.database import get_db, utcnow, utcnow_naive
+from app.jwt_backend import (
+    TokenDecodeError,
+    _decode_access_payload,
+    decode_jwt,
+    encode_jwt,
+)
+from app.jwt_backend import (
+    create_access_token as _jwt_create_access_token,
+)
 from app.models import APIKey, User
+from app.security import _is_token_revoked, increment_metric
+
+_auth_oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
 class StartupConfigurationError(RuntimeError):
@@ -229,9 +241,7 @@ def _create_token(
 
 
 def create_access_token(subject: str) -> str:
-    return _create_token(
-        subject=subject, token_type="access", expires_minutes=ACCESS_TOKEN_EXPIRE_MINUTES
-    )
+    return _jwt_create_access_token(subject=subject)
 
 
 def create_refresh_token(user: User) -> str:
@@ -256,13 +266,20 @@ def decode_token(
     )
 
     try:
-        payload = decode_jwt(
-            token=token,
-            secret=SECRET_KEY,
-            algorithm=ALGORITHM,
-            audience=JWT_AUDIENCE,
-            issuer=JWT_ISSUER,
-        )
+        if expected_type == "access":
+            payload = _decode_access_payload(
+                token=token,
+                audience=JWT_AUDIENCE,
+                issuer=JWT_ISSUER,
+            )
+        else:
+            payload = decode_jwt(
+                token=token,
+                secret=SECRET_KEY,
+                algorithm=ALGORITHM,
+                audience=JWT_AUDIENCE,
+                issuer=JWT_ISSUER,
+            )
     except TokenDecodeError:
         raise cred_exc
 
@@ -337,3 +354,39 @@ def get_user_by_username(db: Session, username: str) -> Optional[User]:
 def validate_refresh_token_version(payload: dict, user: User) -> None:
     if payload.get("rv") != user.refresh_token_version:
         raise HTTPException(status_code=401, detail="Invalid refresh token")
+
+
+def get_current_user(
+    db: Session = Depends(get_db), token: str = Depends(_auth_oauth2_scheme)
+) -> User:
+    payload = decode_token(
+        token=token,
+        expected_type="access",
+        is_token_revoked=lambda jti: _is_token_revoked(db, jti),
+    )
+    username = payload["sub"]
+    user = get_user_by_username(db, username)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    increment_metric("jwt_auth_successes", 1)
+    return user
+
+
+async def get_raw_payload(
+    token: str = Depends(_auth_oauth2_scheme),
+) -> dict:
+    from app.jwt_backend import TokenDecodeError as _TDE
+    from app.jwt_backend import get_raw_payload as _decode
+
+    try:
+        return _decode(token)
+    except _TDE:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )

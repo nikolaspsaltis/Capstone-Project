@@ -1,4 +1,5 @@
 from app import main as main_app
+from app.models import AuditLog
 
 
 def register(client, username: str, password: str, role: str | None = None):
@@ -98,3 +99,34 @@ def test_admin_can_query_audit_logs_with_filters(client):
     )
     assert bob_only.status_code == 200
     assert any(item["actor_username"] == "bob" for item in bob_only.json()["items"])
+
+
+def test_audit_chain_is_valid_after_events(admin_client):
+    for _ in range(3):
+        r = admin_client.get("/admin/users")
+        assert r.status_code == 200
+
+    resp = admin_client.get("/admin/audit-logs/verify")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["chain_valid"] is True
+    assert body["ok"] is True
+    assert body["records"] >= 3
+
+
+def test_audit_chain_detects_tampering(admin_client, db_session):
+    for _ in range(3):
+        admin_client.get("/admin/users")
+
+    rows = db_session.query(AuditLog).order_by(AuditLog.id).all()
+    assert len(rows) >= 2
+    # Tamper the prev_hash of the second record
+    rows[1].prev_hash = "deadbeef" * 8
+    db_session.commit()
+
+    resp = admin_client.get("/admin/audit-logs/verify")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["chain_valid"] is False
+    assert body["ok"] is False
+    assert body["first_broken_id"] == rows[1].id

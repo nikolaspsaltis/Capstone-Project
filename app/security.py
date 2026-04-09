@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -80,6 +81,41 @@ def _extract_client_ip(request: Optional[Request]) -> str:
     return "unknown"
 
 
+def _compute_record_hash(
+    prev_hash: str,
+    ts: str,
+    action: str,
+    actor: str,
+    target: str,
+    decision: str,
+) -> str:
+    """Deterministic SHA-256 over the chain link fields."""
+    data = f"{prev_hash}{ts}{action}{actor}{target}{decision}"
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def append_audit_event(
+    db: Session,
+    event_type: str,
+    actor: str,
+    target: str,
+    decision: str,
+) -> None:
+    """Simple public interface for inserting a chained audit event.
+
+    For callers that don't need the full _write_audit_log parameter set
+    (e.g. broker and workload-identity chunks).
+    """
+    _write_audit_log(
+        db=db,
+        action=event_type,
+        status=decision,
+        actor_username=actor,
+        target_username=target,
+        commit=True,
+    )
+
+
 def _write_audit_log(
     db: Session,
     *,
@@ -93,6 +129,22 @@ def _write_audit_log(
     commit: bool = False,
 ) -> None:
     detail_payload = json.dumps(details, sort_keys=True) if details is not None else None
+    ts = utcnow_naive()
+
+    # Flush so any prior unflushed audit inserts in this transaction are
+    # visible when we query for the tail of the chain.
+    db.flush()
+    last = db.execute(select(AuditLog).order_by(AuditLog.id.desc()).limit(1)).scalars().first()
+    prev_hash = last.record_hash if last else "0" * 64
+    record_hash = _compute_record_hash(
+        prev_hash,
+        ts.isoformat(),
+        action,
+        actor_username or "",
+        target_username or "",
+        status,
+    )
+
     db.add(
         AuditLog(
             actor_username=actor_username,
@@ -102,6 +154,9 @@ def _write_audit_log(
             target_username=target_username,
             ip_address=_extract_client_ip(request),
             details=detail_payload,
+            created_at=ts,
+            prev_hash=prev_hash,
+            record_hash=record_hash,
         )
     )
     increment_metric("audit_events_total", 1)

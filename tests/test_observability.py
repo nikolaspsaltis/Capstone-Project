@@ -54,7 +54,7 @@ def test_metrics_track_login_failures_lockouts_and_rate_limit_hits(client):
             assert bad.status_code == 401
 
         locked = login(client, "alice", "secret123")
-        assert locked.status_code == 403
+        assert locked.status_code == 429
     finally:
         security_app.RATE_LIMIT_MAX_ATTEMPTS = original_limit
 
