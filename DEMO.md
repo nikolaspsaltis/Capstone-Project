@@ -104,7 +104,7 @@ Run one attack script:
 python scripts/bruteforce_login.py
 ```
 
-Expected: by attempt 3 or 4 you should see `403` responses, showing lockout defense after repeated failed logins.
+Expected: by attempt 3 or 4 you should see `429` responses with a `Retry-After` header, showing account lockout defense after repeated failed logins.
 
 ## Results talking points (30 seconds)
 - CSV example: `results/performance_20260304_154048.csv`

@@ -28,7 +28,7 @@ def test_api_key_scopes_enforced_on_data_endpoint(client):
         json={"name": "metrics-only", "scopes": ["metrics:read"]},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
-    assert restricted_key.status_code == 200
+    assert restricted_key.status_code == 201
     restricted_raw_key = restricted_key.json()["api_key"]
 
     denied = client.get("/data", headers={"X-API-Key": restricted_raw_key})
@@ -39,7 +39,7 @@ def test_api_key_scopes_enforced_on_data_endpoint(client):
         json={"name": "data-key", "scopes": ["data:read"]},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
-    assert data_key.status_code == 200
+    assert data_key.status_code == 201
     assert data_key.json()["metadata"]["scopes"] == ["data:read"]
 
     allowed = client.get("/data", headers={"X-API-Key": data_key.json()["api_key"]})
@@ -68,7 +68,7 @@ def test_api_key_rotate_preserves_or_updates_scopes(client):
         json={"name": "rotatable", "scopes": ["metrics:read"]},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
-    assert created.status_code == 200
+    assert created.status_code == 201
     key_id = created.json()["metadata"]["id"]
 
     rotated = client.post(

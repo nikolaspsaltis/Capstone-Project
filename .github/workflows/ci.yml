@@ -56,6 +56,8 @@ jobs:
           JWT_AUDIENCE: capstone-tests-client
           DATABASE_URL: sqlite:///./ci_test.db
           API_KEYS: test-api-key
+          TESTING: "1"
+          BCRYPT_TEST_ROUNDS: "4"
         run: |
           pytest
 
@@ -65,7 +67,7 @@ jobs:
           JWT_ISSUER: capstone-project
           JWT_AUDIENCE: capstone-client
           DATABASE_URL: sqlite:///./ci_smoke.db
-          API_KEYS: capstone-demo-key
+          API_KEYS: ci-smoke-api-key
         run: |
           alembic upgrade head
 
@@ -86,7 +88,7 @@ jobs:
             | python -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 
           curl -fsS http://127.0.0.1:8000/profile -H "Authorization: Bearer $TOKEN"
-          curl -fsS http://127.0.0.1:8000/data -H "X-API-Key: capstone-demo-key"
+          curl -fsS http://127.0.0.1:8000/data -H "X-API-Key: ci-smoke-api-key"
 
       - name: Security and load regression smoke
         env:
@@ -94,7 +96,7 @@ jobs:
           JWT_ISSUER: capstone-project
           JWT_AUDIENCE: capstone-client
           DATABASE_URL: sqlite:///./ci_regression.db
-          API_KEYS: capstone-demo-key
+          API_KEYS: ci-regression-api-key
         run: |
           set -euo pipefail
           alembic upgrade head
@@ -124,7 +126,7 @@ jobs:
           JWT_ISSUER: capstone-project
           JWT_AUDIENCE: capstone-client
           DATABASE_URL: sqlite:///./ci_zt.db
-          API_KEYS: capstone-demo-key
+          API_KEYS: ci-zt-api-key
           WORKLOAD_ATTESTATION_SECRET: ci-attestation-secret
           APP_ENV: prod
         run: |

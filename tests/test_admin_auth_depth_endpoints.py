@@ -105,7 +105,7 @@ def test_admin_api_key_revoke_is_idempotent(client):
         json={"name": "to-revoke"},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
-    assert created.status_code == 200
+    assert created.status_code == 201
     key_id = created.json()["metadata"]["id"]
 
     first = client.post(
@@ -132,7 +132,7 @@ def test_admin_api_key_with_expiry_becomes_invalid(client):
         json={"name": "short-lived", "expires_minutes": 1},
         headers={"Authorization": f"Bearer {admin_token}"},
     )
-    assert created.status_code == 200
+    assert created.status_code == 201
     raw_key = created.json()["api_key"]
     key_id = created.json()["metadata"]["id"]
 

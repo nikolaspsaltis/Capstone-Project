@@ -67,7 +67,7 @@ def test_admin_optional_mfa_totp_flow(client):
                 )
             },
         )
-        assert setup.status_code == 200
+        assert setup.status_code == 201
         secret = setup.json()["secret"]
 
         code = auth_app.generate_totp_code(secret=secret, for_timestamp=int(time.time()))
@@ -115,7 +115,7 @@ def test_api_key_metadata_rotation_and_revoke(client):
         json={"name": "integration-key"},
         headers={"Authorization": f"Bearer {admin_access}"},
     )
-    assert create.status_code == 200
+    assert create.status_code == 201
     raw_key = create.json()["api_key"]
     key_id = create.json()["metadata"]["id"]
 

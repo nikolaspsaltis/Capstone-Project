@@ -11,6 +11,7 @@ __pycache__/
 .env
 app.db
 test_app.db
+smoke_test.db
 jwt_signing.pem
 *.pem
 
