@@ -1,0 +1,99 @@
+version: "3.9"
+
+# Zero-trust two-service deployment
+# ===================================
+# Service topology:
+#
+#   [api]  <──── workload attestation + token exchange
+#     │
+#     └── issues scoped tokens for ──► [downstream]
+#
+# The api service is the trust authority: it issues workload SVIDs, runs the
+# token exchange broker, and maintains the service registry. The downstream
+# service accepts only tokens whose audience matches its SERVICE_AUDIENCE env var.
+#
+# Usage:
+#   docker compose up --build
+#
+# Run the zero-trust demo flow manually after the services are up:
+#   python scripts/demo_service_to_service.py
+#
+# Required secrets (set in a .env file or export before running):
+#   JWT_SECRET              — HS256 secret for refresh tokens (min 32 chars)
+#   API_KEYS                — comma-separated list of seeded API keys
+#   WORKLOAD_ATTESTATION_SECRET — shared HMAC secret for workload attestation
+
+services:
+
+  # ─────────────────────────────────────────────
+  # api — the secure API / trust authority
+  # ─────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: capstone-api
+    ports:
+      - "8000:8000"
+    environment:
+      # JWT configuration
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-min-32-chars}
+      JWT_ISSUER: capstone-project
+      JWT_AUDIENCE: capstone-client
+      JWT_PRIVATE_KEY_PATH: /data/jwt_signing.pem
+
+      # API key seeding (comma-separated; first key is used by the downstream demo)
+      API_KEYS: ${API_KEYS:-local-dev-api-key}
+
+      # Workload identity
+      WORKLOAD_ATTESTATION_SECRET: ${WORKLOAD_ATTESTATION_SECRET:-change-me-attestation-secret}
+      APP_ENV: prod
+
+      # Database stored on a named volume so it persists across restarts
+      DATABASE_URL: sqlite:////data/app.db
+
+      # Logging
+      LOG_LEVEL: INFO
+
+      # CORS — allow the downstream service to make cross-origin calls if needed
+      ALLOWED_ORIGINS: http://localhost:3000,http://downstream:8001
+    volumes:
+      - api-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # downstream — minimal protected resource service
+  # ─────────────────────────────────────────────
+  downstream:
+    build:
+      context: ./downstream-service
+      dockerfile: Dockerfile
+    container_name: capstone-downstream
+    ports:
+      - "8001:8001"
+    environment:
+      # Must match the audience registered in the api service's service registry
+      # and the target_audience used in POST /token/exchange
+      SERVICE_AUDIENCE: https://data-service.internal
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  # Persistent storage for the SQLite database and the Ed25519 signing key.
+  # Mounting as a named volume ensures the signing key survives container restarts
+  # so tokens issued in previous sessions remain verifiable.
+  api-data:

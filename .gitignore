@@ -15,6 +15,9 @@ smoke_test.db
 jwt_signing.pem
 *.pem
 
+# Docker volumes and container state
+api-data/
+
 # Generated result artifacts not intended for version control
 results/*.csv
 results/*.log
