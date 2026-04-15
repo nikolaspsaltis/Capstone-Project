@@ -154,6 +154,42 @@ def attack_dev_token_targeting_prod(base_url: str) -> bool:
     return passed
 
 
+def _seed_eval_fixtures(base_url: str) -> None:
+    """Register accounts and service registry entries required by attack scenarios.
+
+    Creates:
+    - testuser/testpass (regular user, needed by ATTACK-1 and ATTACK-2)
+    - admin/adminpass   (admin account, needed to call /admin/service-registry)
+    - eval-worker entry in the service registry (needed by ATTACK-3)
+
+    All requests are idempotent — duplicate registration or 409 on the service
+    registry are silently ignored so the function is safe to call multiple times.
+    """
+    import httpx
+
+    # Register test accounts (ignore 400 if already exist)
+    httpx.post(f"{base_url}/register", json={"username": "testuser", "password": "testpass"})
+    httpx.post(f"{base_url}/register", json={"username": "admin", "password": "adminpass"})
+
+    # Promote admin account — requires a pre-existing admin token seeded via API key
+    api_key = os.environ.get("API_KEYS", "").split(",")[0].strip()
+    if not api_key:
+        return
+
+    headers = {"X-API-Key": api_key}
+
+    # Register eval-worker for ATTACK-3 (ignore 409 if already registered)
+    httpx.post(
+        f"{base_url}/admin/service-registry",
+        json={
+            "service_id": "eval-worker",
+            "audience": "https://eval-worker.internal",
+            "allowed_callers": ["workload:eval-worker"],
+        },
+        headers=headers,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run Capstone evaluation scripts and zero-trust attack scenarios"
@@ -165,6 +201,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     base_url = args.base_url.rstrip("/")
+
+    # Seed the service registry entries needed by attack scenarios before running them.
+    _seed_eval_fixtures(base_url)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
