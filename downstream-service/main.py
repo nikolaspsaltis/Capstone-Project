@@ -16,10 +16,11 @@ audience claim matches the expected value. In a production deployment this servi
 would fetch the JWKS from the API server and verify signatures independently.
 """
 
+import base64
+import json
 import os
 
 from fastapi import FastAPI, Header, HTTPException
-import base64, json
 
 app = FastAPI(title="Downstream Data Service")
 
