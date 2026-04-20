@@ -27,3 +27,9 @@ submission.zip
 .pytest_cache/
 .ruff_cache/
 .coverage
+
+# PDO preparation and internal working documents — not part of the submission
+DOCX_EDIT_PROMPT.txt
+PDO_PREP.md
+PDO_GUIDE_FOR_BEGINNERS.md
+CODE_WALKTHROUGH.md

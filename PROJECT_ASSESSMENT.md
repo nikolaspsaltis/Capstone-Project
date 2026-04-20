@@ -1,7 +1,7 @@
 # Project Assessment Report
 
 **Date:** 2026-04-05
-**Project:** Secure APIs for Web Services — University of Edinburgh Capstone
+**Project:** Secure APIs for Web Services — University of Essex Capstone
 **Branch:** `main` | **Head commit:** `500f03c`
 
 ---
