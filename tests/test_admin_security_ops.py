@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+import app.policy as policy_module
 from app import main as main_app
 from app import security as security_app
 from app.models import AuthFailureLog, LoginAttempt, RevokedToken
@@ -184,10 +185,15 @@ def test_admin_cleanup_removes_expired_and_old_records(client):
     finally:
         db.close()
 
-    cleanup = client.post(
-        "/admin/maintenance/cleanup",
-        headers={"Authorization": f"Bearer {admin_access}"},
-    )
+    original_rules = policy_module._rules
+    policy_module._rules = []
+    try:
+        cleanup = client.post(
+            "/admin/maintenance/cleanup",
+            headers={"Authorization": f"Bearer {admin_access}"},
+        )
+    finally:
+        policy_module._rules = original_rules
     assert cleanup.status_code == 200
     body = cleanup.json()
     assert body["status"] == "ok"
